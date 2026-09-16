@@ -1,0 +1,132 @@
+---
+title: "White Screen of Death"
+description: "HTTP 200 with a blank page. Almost always a PHP fatal — here is the ordered way to find it, including the FTP trick when wp-admin is blank too."
+difficulty: Beginner
+timeToFix: "10–40 min"
+appliesTo: [WordPress Core, Plugins, Themes, PHP]
+tags: [fatal-error, php, debug, logs, recovery]
+severity: Critical
+updated: 2026-01-17
+featured: true
+---
+
+## Symptoms
+
+- The page returns HTTP 200 but the body is empty (or ends mid-render with no error text).
+- Often appears right after a plugin/theme update, a PHP version change, or a `functions.php` edit.
+- Sometimes only the admin is blank; sometimes only specific templates are blank.
+- A "critical error" message variant exists (WordPress 5.2+ catches plugin/theme fatals and prints a friendly message instead of a blank page).
+
+## Possible Causes
+
+1. PHP fatal error from a plugin/theme (missing semicolon, renamed function, PHP 8 incompatibility).
+2. Memory exhaustion during render — the process dies so late that only a partial page is flushed.
+3. A half-completed plugin/theme update (files present, autoloader incomplete).
+4. A white space or BOM before `<?php` in `wp-config.php` or `functions.php`, breaking headers.
+5. A site-URL/host mismatch causing an internal redirect loop that renders nothing.
+6. Object cache drop-in pointing at a Redis/Memcached instance that is gone.
+
+## Prerequisites
+
+- SFTP/SSH access (the fastest path when wp-admin is blank).
+- The PHP error log for the site, or permission to write one.
+- Database + files snapshot before you start toggling things.
+
+## Investigation
+
+1. **Confirm blank, not redirected.** Sizes matter: a 0-byte body is a PHP death; a 302 is a different article.
+
+```bash
+curl -sS -o /dev/null -w 'status=%{http_code} bytes=%{size_download} redirect=%{redirect_url}\n' https://example.com/?x=1
+```
+
+2. **Find the fatal.** Read the site log; if the host hides it, write one to a path you control.
+
+```bash
+tail -n 120 ~/logs/php_error.log
+grep -in 'fatal\|memory' ~/logs/php_error.log | tail -20
+```
+
+3. **Get back into the dashboard.** Two safe routes:
+
+- Rename the offending folder over SFTP (WordPress auto-deactivates a missing plugin/theme):
+
+```bash
+mv wp-content/plugins/suspect-slug ~/disabled/suspect-slug
+mv wp-content/themes/broken-child ~/disabled/broken-child
+```
+
+- Or use Recovery Mode: WordPress e-mails a link like `/wp-login.php?action=enter_recovery_mode&rm_token=…` to the admin address after a plugin/theme fatal.
+
+4. **Disable everything, then re-enable in halves** (log₂n passes instead of n).
+
+```bash
+wp plugin deactivate --all
+wp plugin list --status=active
+wp theme activate twentytwentyfour
+```
+
+5. **Check the filesystem suspects** — the top two "it worked yesterday" causes.
+
+```bash
+find wp-content -name '*.php' -newermt '1 day ago' | head -20
+php -l wp-content/themes/child/functions.php
+```
+
+6. **Rule out cache drop-in and memory.**
+
+```bash
+mv wp-content/object-cache.php ~/disabled/object-cache.php   # if Redis is gone
+wp eval 'echo ini_get("memory_limit");'
+```
+
+## Diagnosis
+
+| Evidence | Interpretation |
+| --- | --- |
+| Blank admin **and** blank frontend, fatal in a plugin file | That plugin is the cause |
+| Frontend blank, admin fine, fatal in theme | Theme/child theme code |
+| Body ends halfway through HTML | Fatal mid-render: often memory or a bad template part |
+| `Cannot redeclare` or `Class not found` | Duplicate plugin or incomplete update |
+| Everything blank right after a PHP switch | Removed functions / `create_function` era code |
+
+## Resolution
+
+1. Update the failing plugin/theme to a version that supports the current PHP release, or roll back to the last working version.
+2. If the fatal is in a child theme you control, fix the code with `php -l` validation before uploading.
+3. If the fatal is inside a snippet manager snippet, deactivate the snippet (which disables the plugin that ran it) then correct the code.
+4. Increase memory only after you have the stack trace that proves the request is legitimately heavy.
+5. Remove debug constants, delete the log, and re-enable the security/cache layers you had switched off.
+
+::: danger
+Never fix a blank page by `chmod -R 777`. It converts a 10-minute rollback into a compromise investigation, and it hides the real cause (ownership or path problems).
+:::
+
+## Verification
+
+- Frontend, admin, REST (`/wp-json/`) and one form submission all render.
+- No new fatal lines when you replay the exact original reproduction steps.
+- Users can log in and the dashboard is usable (no partial-render warnings).
+
+## Root Cause
+
+A WSOD is PHP terminating the request. WordPress cannot help you: it never reached the point of handling the error, which is why the log is the only reliable evidence.
+
+## Prevention
+
+- Update on staging first, with a snapshot; only then promote to production.
+- Keep an admin `error_log`/`debug.log` rotation and a monitor for new fatals.
+- Treat PHP-version upgrades as a project, not a toggle: inventory plugin compatibility first.
+- Keep one recovery channel that does not depend on wp-admin: SSH/SFTP, wp-cli, or Recovery Mode.
+
+## Related Articles
+
+- [/errors/critical-error](/errors/critical-error)
+- [/plugins/plugin-fatal-error](/plugins/plugin-fatal-error)
+- [/wordpress/recovery-mode](/wordpress/recovery-mode)
+- [/runbooks/white-screen](/runbooks/white-screen)
+
+## Official References
+
+- [Debugging in WordPress](https://developer.wordpress.org/advanced-administration/debug/debug-wordpress/)
+- [Recovery Mode](https://developer.wordpress.org/advanced-administration/security/recovery-mode/)

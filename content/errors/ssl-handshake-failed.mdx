@@ -1,0 +1,121 @@
+---
+title: "SSL Handshake Failed / Certificate Invalid"
+description: "Read the certificate the server actually serves, then separate SNI, expiry, chain, CDN-mode and firewall problems in minutes."
+difficulty: Intermediate
+timeToFix: "15–60 min"
+appliesTo: [SSL, Hosting, CDN, DNS]
+tags: [ssl, hosting, dns, cloudflare, logs]
+severity: Critical
+updated: 2026-01-10
+---
+
+## Symptoms
+
+- Chrome: `ERR_SSL_PROTOCOL_ERROR`, `ERR_CERT_DATE_INVALID`, `ERR_CERT_COMMON_NAME_INVALID` or `ERR_SSL_VERSION_OR_CIPHER_MISMATCH`.
+- `curl` output: `SSL certificate problem: certificate has expired`, `self signed certificate`, `unable to get local issuer certificate`.
+- Some browsers/users affected and others not (caching, SNI or multiple hostnames).
+- WooCommerce payments, webhooks or API integrations failing with TLS errors in logs.
+
+## Possible Causes
+
+1. Certificate expired — auto-renewal failed because the ACME HTTP-01 challenge could not reach port 80.
+2. Certificate does not cover the hostname being requested (`example.com` vs `www.example.com`).
+3. SNI mismatch: the vhost served is the first/default one, not the requested host.
+4. Missing intermediate certificate in the chain (works in browsers with cached intermediates, fails in curl/Java/APIs).
+5. CDN SSL mode mismatch: Full (flexible) with an HTTPS-only origin, or an origin certificate not trusted.
+6. Old client (or an old TLS library inside a payment library) rejecting TLS 1.3-only configurations.
+7. Clock skew on the client/server making a valid certificate look expired.
+
+## Prerequisites
+
+- The exact hostname(s) and the full curl/openssl error text.
+- Panel access to re-issue a certificate and to check email/HTTP validation settings.
+- CDN dashboard access when the record is proxied.
+
+## Investigation
+
+1. **Ask the server what it is really serving.**
+
+```bash
+openssl s_client -connect example.com:443 -servername example.com </dev/null 2>/dev/null | openssl x509 -noout -subject -issuer -dates -ext subjectAltName
+curl -vI https://example.com/ 2>&1 | grep -Ei 'subject|issuer|expire|SSL|TLS'
+```
+
+2. **Verify each hostname separately** — a common cause is one valid and one broken name.
+
+```bash
+for h in example.com www.example.com; do
+  echo "== $h"; openssl s_client -connect $h:443 -servername $h </dev/null 2>/dev/null | openssl x509 -noout -dates -subject
+done
+curl -sSI --resolve www.example.com:443:ORIGIN_IP https://www.example.com/ | head -3
+```
+
+3. **Check the chain explicitly.**
+
+```bash
+openssl s_client -connect example.com:443 -servername example.com -showcerts </dev/null 2>/dev/null | grep -c 'BEGIN CERTIFICATE'
+```
+
+4. **Look for the issuing automation's log**: Let's Encrypt renewal entries, certbot output, or the panel's SSL status. `curl -x '' http://example.com/.well-known/acme-challenge/test` proves whether validation can work.
+
+5. **Check whether an edge layer is in front** and which certificate it presents.
+
+```bash
+dig +short example.com A | head
+curl -sSI https://example.com/ | grep -Ei 'server|cf-ray|via|x-cache'
+```
+
+## Diagnosis
+
+| Evidence | Cause | Fix |
+| --- | --- | --- |
+| Subject is a generic host/hosting default | SNI/vhost mismatch | Correct the vhost order or add the name to the cert |
+| NotAfter date in the past | expired cert / failed renewal | Re-issue; fix the ACME challenge path |
+| Only `www` fails | cert does not include the SAN | Re-issue with both names |
+| Chain count = 1 | missing intermediate | Install the full chain |
+| Fails via CDN, fine at origin | CDN SSL mode/cert | Switch to Full (strict), upload/renew origin cert |
+| Fails only from one application | client TLS/CA bundle too old | Update the client or allow TLS 1.2 |
+
+::: investigate
+Investigation mindset: never trust a browser's error text alone. The certificate the server serves, the names it covers, and the issuer are three facts you can read in seconds — and they collapse most TLS tickets to one line of output.
+:::
+
+## Resolution
+
+1. **Re-issue the certificate** covering every hostname you serve (apex + `www` + any subdomain that must be secure).
+2. **Fix the validation path** for future renewals: HTTP-01 needs port 80 reachable; DNS-01 needs the right TXT record; check for redirects on `.well-known`.
+3. **Install the full chain** including intermediates; verify with a checker as well as openssl.
+4. **Align the CDN** to Full (strict) and confirm the origin certificate is valid and not self-signed; keep "always use HTTPS" as the only redirect layer.
+5. **Force HTTPS** only after every hostname validates (see [/errors/err-too-many-redirects](/errors/err-too-many-redirects) before you enable HSTS).
+6. **Update clients** where an integration is failing: refresh CA bundles, and enable TLS 1.2 as a fallback while you confirm with the user.
+
+## Verification
+
+- `curl -sSI https://` works for every hostname with no `--insecure` flag.
+- Chain has two or more certificates; issuer is the expected CA.
+- Panel/automation shows a renewed certificate with the expiry date you expect.
+- Payments, webhooks and outbound API calls work; no new TLS errors in the logs.
+
+## Root Cause
+
+TLS failures are negotiation or trust failures, not WordPress failures. The five mechanisms — expiry, name coverage, SNI, chain, and edge/origin mode — cover nearly every ticket.
+
+## Prevention
+
+- Monitor certificate expiry at 21/7/3 days for every hostname.
+- Automate renewal with a validation method that survives your redirect rules.
+- Document which layer terminates TLS; ambiguous ownership is the root of most SSL incidents.
+- Keep a TLS inventory in the environment documentation (hostname → issuer → layer).
+
+## Related Articles
+
+- [/hosting/dns-not-propagating](/hosting/dns-not-propagating)
+- [/errors/err-too-many-redirects](/errors/err-too-many-redirects)
+- [/errors/mixed-content](/errors/mixed-content)
+- [/hosting/cpanel](/hosting/cpanel)
+
+## Official References
+
+- [Let's Encrypt: Challenge types](https://letsencrypt.org/docs/challenge-types/)
+- [Cloudflare: SSL modes](https://developers.cloudflare.com/ssl/origin-configuration/ssl-modes/)
+- [MDN: TLS (Transport Layer Security)](https://developer.mozilla.org/en-US/docs/Web/Security/Transport_Layer_Security)

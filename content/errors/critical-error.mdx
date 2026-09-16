@@ -1,0 +1,120 @@
+---
+title: "There Has Been a Critical Error on This Website"
+description: "WordPress caught a plugin or theme fatal and showed you the friendly version. Learn where the real message lives and how to reach Recovery Mode."
+difficulty: Beginner
+timeToFix: "10–30 min"
+appliesTo: [WordPress Core, Plugins, Themes]
+tags: [fatal-error, debug, logs, recovery, plugin]
+severity: High
+updated: 2026-01-13
+---
+
+## Symptoms
+
+- Frontend or admin shows: "There has been a critical error on this website. Please check your site admin email inbox for instructions."
+- Usually one specific page/template, sometimes the whole site or the whole admin.
+- An email arrives from WordPress with a link to Recovery Mode (since 5.2).
+- REST API requests can return this as JSON (`{"code":"internal_server_error"}`).
+
+## Possible Causes
+
+1. PHP fatal inside a plugin or theme, caught by WordPress' fatal error handler (the classic cause).
+2. A plugin updated to a version incompatible with the installed PHP release.
+3. `functions.php` or a snippet edited with a syntax error.
+4. A cron or AJAX task that dies mid-request, producing this message where a blank page used to appear.
+5. A theme's template part referencing a removed function.
+
+## Prerequisites
+
+- Access to wp-admin (or Recovery Mode link, or SFTP) — all three are valid entry points.
+- The site's PHP error log, or permission to write `WP_DEBUG_LOG`.
+- A snapshot before toggling plugins on production.
+
+## Investigation
+
+1. **Open the Recovery Mode email link** if absent-minded edits are suspected — it signs you in without any plugin/theme.
+
+```text
+https://example.com/wp-login.php?action=enter_recovery_mode&rm_token=XXXXXXXX&rm_key=YYYYYYYY
+```
+
+2. **Find the underlying fatal** in the log (the friendly page hides it; the log never does).
+
+```bash
+grep -i 'PHP Fatal' ~/logs/php_error.log | tail -20
+tail -n 120 wp-content/debug.log
+```
+
+3. **If there is no usable log**, enable one on staging or to a non-public path, then reproduce once.
+
+```php
+define( 'WP_DEBUG', true );
+define( 'WP_DEBUG_LOG', dirname( ABSPATH ) . '/logs/wp-debug.log' );
+define( 'WP_DEBUG_DISPLAY', false );
+```
+
+4. **Deactivate through wp-cli or the file system** when the admin is blocked.
+
+```bash
+wp plugin list --status=active
+wp plugin deactivate suspect-slug
+wp theme activate twentytwentyfour
+```
+
+5. **Identify the trigger surface** — the template or endpoint that fails tells you which component to suspect.
+
+| Failing surface | Likely owner |
+| --- | --- |
+| Single product page | WooCommerce or a payment/shipping add-on |
+| Elementor editor only | Elementor + one widget add-on |
+| Admin screens under one menu | that plugin's admin code |
+| `wp-cron.php` / REST | a scheduled or API-integration plugin |
+| Every page | core, theme or a global hook |
+
+::: investigate
+Investigation mindset: the message is a *presentation* change, not a new bug class. Treat it exactly like a white screen — find the first fatal, then isolate one variable at a time.
+:::
+
+## Diagnosis
+
+- Fatal in a plugin file, on a specific URL → that plugin's code path.
+- Fatal after an update within the last hour → roll back first, analyse second.
+- Fatal only with the current PHP version → compatibility matrix problem.
+- Fatal mentions `Cannot redeclare` → duplicate code (two plugins or a snippet copying plugin logic).
+
+## Resolution
+
+1. Update the plugin/theme if a fix exists; otherwise roll back to the last known-good version and report the regression.
+2. If it is your own snippet/child theme code: fix it locally, validate with `php -l`, then deploy.
+3. If a plugin's own fatal recurs and there is no fix, document a workaround, disable it, and communicate the impact to the site owner.
+4. After the fix, remove debug constants and delete logs, then re-enable anything you disabled during the test (cache, security, staging plugin).
+
+## Verification
+
+- The previously failing page loads as a logged-out user in a private window.
+- Admin pages for the affected plugin load without the message.
+- No new fatal in the log when replaying the original steps.
+- Site Health shows no "deactivated due to error" plugins.
+
+## Root Cause
+
+WordPress 5.2+ installs a fatal error handler for plugin/theme code and swaps the white page for an informative message, sending an admin email. The bug is the same fatal; only the presentation changed.
+
+## Prevention
+
+- Use Recovery Mode guidance in the team runbook so any engineer can regain access quickly ([/wordpress/recovery-mode](/wordpress/recovery-mode)).
+- Always test plugin updates on staging, and keep a rollback version of critical plugins.
+- Keep `WP_DEBUG_LOG` on in staging so fatals are never invisible.
+- Add uptime checks for `/wp-json/` so API-level fatals page you before customers notice.
+
+## Related Articles
+
+- [/errors/white-screen-of-death](/errors/white-screen-of-death)
+- [/wordpress/recovery-mode](/wordpress/recovery-mode)
+- [/plugins/plugin-conflict](/plugins/plugin-conflict)
+- [/runbooks/white-screen](/runbooks/white-screen)
+
+## Official References
+
+- [Recovery Mode](https://developer.wordpress.org/advanced-administration/security/recovery-mode/)
+- [Debugging in WordPress](https://developer.wordpress.org/advanced-administration/debug/debug-wordpress/)

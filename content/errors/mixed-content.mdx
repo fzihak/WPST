@@ -1,0 +1,125 @@
+---
+title: "Mixed Content Warning"
+description: "The padlock disappears and assets fail because some URLs still point at http. Find them all — database, theme, plugin and hardcoded — without breaking serialized data."
+difficulty: Intermediate
+timeToFix: "20–60 min"
+appliesTo: [WordPress Core, SSL, Database, Themes]
+tags: [ssl, redirect, database, cloudflare, frontend]
+severity: Medium
+updated: 2026-01-11
+---
+
+## Symptoms
+
+- Browser console: "Mixed Content: The page at 'https://site.com' was loaded over HTTPS, but requested an insecure resource 'http://site.com/…'".
+- The padlock is missing, or shows as "Not secure"; some sites get the yellow warning page.
+- Broken or unstyled areas: images, fonts, a slider, a Google Fonts link, an analytics script.
+- Payment/checkout pages can be blocked outright by gateways when the padlock is absent.
+
+## Possible Causes
+
+1. Absolute `http://` URLs stored in the database (post content, widget options, page-builder data, `wp_options`).
+2. Plugins or a template hardcoding `http://` for CDN, fonts or API endpoints.
+3. `siteurl`/`home` correct but a CDN or image-optimisation service rewriting URLs to `http`.
+4. A leftover redirect from `https` to `http` on one hostname (often `www`).
+5. Object/page cache serving pre-migration HTML.
+6. Hardcoded URLs inside theme CSS/JS (in `wp-content/themes/.../assets`).
+
+## Prerequisites
+
+- A working SSL certificate on every hostname that serves the site.
+- Full database backup (search-replace changes content — irreversible without one).
+- Staging environment preferred; if not available, a maintenance window and a backup.
+
+## Investigation
+
+1. **List the offenders from the browser first** — the console gives you exact URLs, and that tells you the layer.
+
+```bash
+curl -sS https://example.com/ | grep -o 'http://[^"'"'"' ]*' | sort -u | head -40
+```
+
+2. **Check the configured URLs and confirm SSL is enforced.**
+
+```bash
+wp option get siteurl
+wp option get home
+curl -sSI https://example.com/ | grep -i 'strict-transport'
+```
+
+3. **Look for http:// occurrences where they hurt** (options, post content, builder metadata) before running any replacement.
+
+```sql
+SELECT option_name, LENGTH(option_value) FROM wp_options WHERE option_value LIKE '%http://example.com%';
+SELECT COUNT(*) FROM wp_posts WHERE post_content LIKE '%http://example.com%';
+SELECT COUNT(*) FROM wp_postmeta WHERE meta_value LIKE '%http://example.com%';
+```
+
+4. **Check the theme/plugin source for hardcoded URLs** (no database fix will help here).
+
+```bash
+grep -rn "http://example.com" wp-content/themes/active-theme --include='*.php' --include='*.css' --include='*.js' | head -20
+```
+
+5. **Test with caches purged** — a stale cache can keep shipping old HTML after a successful fix.
+
+::: investigate
+Investigation mindset: mixed content is a *data* problem more often than a *code* problem. Decide first whether the URL is stored in the database or in a file, then choose the tool — search-replace or code change.
+:::
+
+## Diagnosis
+
+| Where the http:// URL appears | Layer | Fix |
+| --- | --- | --- |
+| Post/page content | database | `wp search-replace --precise` |
+| Builder widget settings (JSON in postmeta) | serialized data | search-replace with `--all-tables --precise` |
+| Widget options / theme mods | options | normalise, then re-save the widget |
+| Rendered HTML only, none in DB | plugin/CDN rewriting | fix the plugin or CDN setting |
+| CSS/JS asset URL | theme file | edit the file or use a relative URL |
+| Every page after migration | cache | purge page cache + CDN |
+
+## Resolution
+
+1. **Fix the canonical URLs** and enforce HTTPS in one place (panel/CDN/`.htaccess`).
+2. **Replace HTTP URLs safely** — never run raw SQL on serialized data.
+
+```bash
+wp search-replace 'http://example.com' 'https://example.com' --all-tables --precise --dry-run
+wp search-replace 'http://example.com' 'https://example.com' --all-tables --precise
+wp cache flush
+```
+
+3. **Fix hardcoded plugin/theme URLs** by patching the theme (child theme where possible) or updating the plugin; prefer protocol-relative or dynamically generated URLs such as `home_url()` / `get_template_directory_uri()`.
+4. **Fix CDN and optimisers**: disable URL rewriting experiments, clear their caches, and confirm they serve `https` versions of assets.
+5. **Re-verify with the same console scan** and check the request chain for any remaining `http` asset.
+
+## Verification
+
+- Browser console has zero mixed-content warnings on homepage, one post, shop, cart and checkout.
+- Padlock present; `curl -sSI` shows only HTTPS asset references.
+- `wp option get siteurl` and `home` are both HTTPS, and no `http://example.com` remains where it matters.
+- Run a site-wide crawler (or `wp search-replace --dry-run`) to confirm nothing is left.
+
+## Root Cause
+
+WordPress stores absolute URLs in content and options. Migrating to HTTPS changes the canonical URL, but historical data keeps the old scheme until it is rewritten.
+
+## Prevention
+
+- Always run a search-replace as part of migrations ([/checklists/migration](/checklists/migration)).
+- Use `home_url()` and relative paths in custom code; never hardcode the scheme.
+- Add a post-deploy check for mixed-content warnings in the release checklist.
+- Keep HSTS after you have proven every hostname serves HTTPS correctly.
+
+## Related Articles
+
+- [/errors/ssl-handshake-failed](/errors/ssl-handshake-failed)
+- [/mysql/search-replace](/mysql/search-replace)
+- [/migration/migrate-wordpress-site](/migration/migrate-wordpress-site)
+- [/hosting/cpanel](/hosting/cpanel)
+
+## Official References
+
+- [MDN: Mixed content](https://developer.mozilla.org/en-US/docs/Web/Security/Mixed_content)
+- [WP-CLI: search-replace](https://developer.wordpress.org/cli/commands/search-replace/)
+- [WordPress: Moving an existing installation](https://developer.wordpress.org/advanced-administration/upgrade/migrating/)

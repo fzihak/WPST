@@ -1,0 +1,148 @@
+---
+title: "WordPress Update Failed or Stuck in Maintenance Mode"
+description: "From 'briefly unavailable for scheduled maintenance' to half-installed updates: diagnose filesystem permissions, timeouts and update locks, and finish cleanly."
+difficulty: Intermediate
+timeToFix: "15–60 min"
+appliesTo: [WordPress Core, Hosting, Filesystem]
+tags: [update, maintenance, hosting, permissions, backup]
+severity: High
+updated: 2026-01-07
+featured: true
+---
+
+## Symptoms
+
+- Frontend shows "Briefly unavailable for scheduled maintenance. Check back in a minute." indefinitely.
+- Core/plugin/theme update ends with "The update failed" or spins forever.
+- Update says success but the site shows mixed versions or a fatal error afterwards.
+- `wp-content/upgrade` contains leftover folders; `.maintenance` still exists in the root.
+
+## Possible Causes
+
+1. `.maintenance` file left behind because the update request died mid-process (timeout, 500, closed browser).
+2. Filesystem permissions/ownership wrong: the web user cannot write to `wp-content`.
+3. Host-level timeouts killing the update (PHP `max_execution_time`, proxy timeout).
+4. Disk quota or inode limit reached — writes fail silently or partially.
+5. `DISALLOW_FILE_MODS` or a security rule blocking write operations.
+6. Update lock (`core_updater.lock` option) stuck from a previous failed attempt.
+7. A plugin hook during upgrade throwing a fatal, or a security plugin blocking HTTP requests to wordpress.org.
+8. Vendor "premium" updates hitting an expired license API.
+
+## Prerequisites
+
+- Full backup (files + database) — updates are the most common way sites break.
+- Disk usage numbers from the panel (space and inodes).
+- SSH or at least File Manager access for cleanup.
+
+## Investigation
+
+1. **Clear the maintenance flag safely and check for leftovers.**
+
+```bash
+wp maintenance-mode status
+wp maintenance-mode deactivate
+ls -la .maintenance wp-content/upgrade
+du -sh wp-content/upgrade
+```
+
+2. **Check the blockers the update screen never tells you about.**
+
+```bash
+df -h && df -i
+wp config get DISALLOW_FILE_MODS
+wp option get core_updater.lock 2>/dev/null; echo $?
+wp option delete core_updater.lock
+find wp-content -maxdepth 2 -not -user $USER | head
+```
+
+3. **Read the log for the moment the update failed** — this is where a timeout or a fatal shows up.
+
+```bash
+grep -iE 'fatal|timeout|memory|permission' ~/logs/php_error.log | tail -30
+tail -n 300 ~/logs/*access*.log | grep -iE 'update|upgrade'
+```
+
+4. **Test whether WordPress can reach its own infrastructure** (updates fetch from wordpress.org).
+
+```bash
+wp core check-update
+curl -sSI https://api.wordpress.org/core/version-check/1.7/ | head -3
+```
+
+5. **Verify writability as the web user**, not as you from SSH.
+
+```bash
+sudo -u www-data touch wp-content/probe && rm wp-content/probe && echo writable
+stat -c '%a %U:%G %n' wp-content wp-content/plugins wp-content/themes
+```
+
+6. **Confirm the installed versions in each layer** to spot a partial update.
+
+```bash
+wp core version
+wp plugin list --status=active --fields=name,version,update
+wp theme list --status=active --fields=name,version
+```
+
+::: investigate
+Investigation mindset: an update failure is an *interrupted transaction*. First restore a consistent state (flag cleared, no half-written files), then find why the interruption happened: write access, timeout, disk, or a fatal.
+:::
+
+## Diagnosis
+
+| Evidence | Mechanism | Fix |
+| --- | --- | --- |
+| `.maintenance` present, no upgrade folder | interrupted request | remove file, re-run update |
+| Files owned by root or wrong user | mixed ownership | fix ownership, then update |
+| Fatal during update in the log | plugin/theme code | deactivate suspects, update via CLI |
+| `df` at 100% / inodes exhausted | disk quota | free space, then update |
+| Filesystem not writable as web user | permissions | correct modes (644/755) and group |
+| Lock present, updates never start | stale lock | delete `core_updater.lock`, retry |
+| Vendor plugin never updates | license/API block | refresh license, manual package |
+
+## Resolution
+
+1. **Clean state**: delete `.maintenance`, clear the lock, remove leftover `wp-content/upgrade` folders.
+2. **Update through WP-CLI** which is far more reliable and gives real output.
+
+```bash
+wp core update --version=latest
+wp plugin update --all
+wp theme update --all
+wp core update-db
+```
+
+3. **Fix the underlying blocker** before retrying: ownership/modes, disk space, timeouts (`max_execution_time`, `max_input_time`), and remove the security rule that blocked wordpress.org requests.
+4. **For a plugin that fails to update**: update manually by uploading the package, or roll back to the previous version and report to the vendor with versions + logs.
+5. **After every update batch**: purge caches (page + object + OPcache/CDN) and re-check the pages that depend on the updates.
+
+## Verification
+
+- `wp core version`, `wp plugin list`, `wp theme list` show the expected versions.
+- No `.maintenance` file, no `*.tmp` or half-extracted folders left behind.
+- Homepage, wp-admin, login, search and one dynamic form all work as a logged-out user.
+- No new fatal errors in the log after a full browse of the site.
+
+## Root Cause
+
+WordPress updates are multi-step file operations: download to `wp-content/upgrade`, extract, move, then clean up while `.maintenance` is set. Any interruption — timeout, disk, permission, fatal — leaves inconsistent state that must be cleaned before retrying.
+
+## Prevention
+
+- Update on staging first; keep a rollback path for critical plugins.
+- Ensure ownership and disk headroom before update windows.
+- Prefer WP-CLI or managed updates with logging so failures are visible.
+- Set `WP_AUTO_UPDATE_CORE` to `minor` and keep plugins updated on a schedule ([/checklists/pre-launch](/checklists/pre-launch)).
+
+## Related Articles
+
+- [/errors/503-service-unavailable](/errors/503-service-unavailable)
+- [/errors/500-internal-server-error](/errors/500-internal-server-error)
+- [/hosting/cpanel](/hosting/cpanel)
+- [/plugins/plugin-fatal-error](/plugins/plugin-fatal-error)
+
+## Official References
+
+- [WordPress: Updating WordPress](https://developer.wordpress.org/advanced-administration/upgrade/updating/)
+- [WP-CLI: core update](https://developer.wordpress.org/cli/commands/core/update/)
+- [WordPress: Troubleshooting updates](https://wordpress.org/documentation/article/updating-wordpress/)

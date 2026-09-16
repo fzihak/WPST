@@ -1,0 +1,150 @@
+---
+title: "Pages Return 404 After Changing Permalinks"
+description: "Pretty permalinks rely on rewrite rules and server configuration. Diagnose the .htaccess/NGINX layer, reset rules, and avoid the trailing-slash traps."
+difficulty: Beginner
+timeToFix: "10–30 min"
+appliesTo: [WordPress Core, Apache, NGINX, Hosting]
+tags: [permalinks, apache, nginx, hosting, redirect]
+severity: Medium
+updated: 2026-01-04
+---
+
+## Symptoms
+
+- Homepage works, every inner page returns 404 after switching to "Post name" permalinks.
+- 404 on category/tag archives, or only on custom post types.
+- Works in wp-admin preview, fails on the frontend URL.
+- 404 appears after a migration, a `.htaccess` edit, or a server change (Apache → NGINX/LiteSpeed).
+
+## Possible Causes
+
+1. Rewrite rules missing: `.htaccess` not writable, or WordPress could not write the rules.
+2. Apache `AllowOverride None`, so `.htaccess` is ignored entirely.
+3. NGINX/LiteSpeed needs a `try_files`/rewrite directive in the vhost; there is no `.htaccess` support.
+4. Custom post type/taxonomy registered without `rewrite` args or registered after `init` priority.
+5. Cached 404s in the browser/page cache/CDN from before the fix.
+6. Trailing-slash or case mismatch in a hardcoded link.
+7. Multisite subdirectory rules missing.
+
+## Prerequisites
+
+- Access to `.htaccess` or the vhost config (panel or SSH).
+- Ability to save permalinks in wp-admin (or run `wp rewrite flush`).
+- Knowledge of whether the site uses Apache, NGINX, LiteSpeed or a proxy.
+
+## Investigation
+
+1. **Confirm the layer by testing a non-existent path** and reading the response headers.
+
+```bash
+curl -sSI https://example.com/about/ | head -6
+curl -sSI https://example.com/this-does-not-exist-abc123/ | head -4
+```
+
+2. **Check the rewrite rules** WordPress believes are active.
+
+```bash
+wp rewrite list --format=table | head -20
+wp option get permalink_structure
+wp rewrite flush --hard
+```
+
+3. **Inspect the web server expectation.**
+
+```bash
+cat .htaccess 2>/dev/null | head -30
+# NGINX: the vhost needs the WordPress block
+grep -n 'try_files' /etc/nginx/sites-enabled/* 2>/dev/null
+```
+
+4. **Verify the post type registration** when only custom post types 404.
+
+```bash
+wp post-type list --fields=name,public,rewrite
+wp rewrite list --match=/product/
+```
+
+5. **Check caching**, because a cached 404 survives many fixes and creates false conclusions.
+
+```bash
+curl -sSI "https://example.com/about/?nocache=$(date +%s)" | grep -iE 'cache|x-cache|cf-cache'
+```
+
+## Diagnosis
+
+| Observation | Cause | Fix |
+| --- | --- | --- |
+| Homepage 200, inner pages 404, Apache | rewrites missing | fix `.htaccess`/AllowOverride, resave permalinks |
+| All pages 404 including `/wp-json/` | server block missing | add try_files/rewrite rules |
+| Only CPTs 404 | registration args | set `rewrite => ['slug' => …]`, flush |
+| Works with `?p=123` | permalinks/structure | flush rules and clear cache |
+| Intermittent 404 behind CDN | cached 404 | purge cache, then retest |
+
+::: investigate
+Investigation mindset: pretty permalinks are a *contract* between WordPress and the web server. Determine which side of the contract is missing before touching post content or plugins.
+:::
+
+## Resolution
+
+1. **Resave permalinks** (Settings → Permalinks → Save) or via CLI, then hard-flush caches.
+
+```bash
+wp rewrite flush --hard
+wp cache flush
+```
+
+2. **Apache**: ensure the WordPress block exists outside any custom rules, and that the directory allows overrides:
+
+```apache
+<IfModule mod_rewrite.c>
+  RewriteEngine On
+  RewriteBase /
+  RewriteRule ^index\.php$ - [L]
+  RewriteCond %{REQUEST_FILENAME} !-f
+  RewriteCond %{REQUEST_FILENAME} !-d
+  RewriteRule . /index.php [L]
+</IfModule>
+```
+
+3. **NGINX / LiteSpeed**: add the equivalent at the vhost level (there is no `.htaccess`):
+
+```nginx
+location / {
+  try_files $uri $uri/ /index.php?$args;
+}
+```
+
+4. **Custom post types**: declare `'rewrite' => [ 'slug' => 'products', 'with_front' => false ]` and flush rules on activation, not on every request.
+5. **Clear every cache layer** (browser, page cache, CDN) and test with cache-busters; 404s are cached aggressively by some CDNs.
+6. **Multisite**: verify the network's `.htaccess`/vhost rules match the install type (subdirectory vs subdomain).
+
+## Verification
+
+- A sample of real URLs (post, page, CPT, category, feed, sitemap) all return 200.
+- `curl -sSI` shows no cached 404 headers after purge.
+- Google Search Console / a crawler reports no new 404 spike for valid pages.
+- Feeds (`/feed/`), sitemaps and the REST API work too.
+
+## Root Cause
+
+WordPress can only *describe* its URL structure in rewrite rules. Whether those rules are executed depends on server configuration — which is invisible to WordPress, hence the silent 404s.
+
+## Prevention
+
+- Add permalink verification to the migration and deployment checklists.
+- On server changes (Apache → NGINX), provision the rewrite block as part of the migration, not after.
+- Register CPTs with explicit rewrite rules and flush on activation only.
+- Keep a canonical trailing-slash policy and enforce it with one redirect rule.
+
+## Related Articles
+
+- [/apache/htaccess](/apache/htaccess)
+- [/nginx/wordpress-rewrites](/nginx/wordpress-rewrites)
+- [/migration/migrate-wordpress-site](/migration/migrate-wordpress-site)
+- [/errors/err-too-many-redirects](/errors/err-too-many-redirects)
+
+## Official References
+
+- [WordPress: Using Permalinks](https://wordpress.org/documentation/article/using-permalinks/)
+- [NGINX: WordPress recipe](https://www.nginx.com/resources/wiki/start/topics/recipes/wordpress/)
+- [WP-CLI: rewrite flush](https://developer.wordpress.org/cli/commands/rewrite/flush/)

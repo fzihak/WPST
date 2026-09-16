@@ -1,0 +1,124 @@
+---
+title: "404 Not Found on Pages That Should Exist"
+description: "Distinguish a deleted URL from a rewrite failure, a cached 404 and a redirect that lost its target. Includes the redirect-map workflow after a migration."
+difficulty: Beginner
+timeToFix: "10–30 min"
+appliesTo: [WordPress Core, Apache, NGINX, Hosting]
+tags: [redirect, permalinks, hosting, migration, seo]
+severity: Medium
+updated: 2025-11-20
+---
+
+## Symptoms
+
+- A page that existed yesterday returns 404 — sometimes for everyone, sometimes only for logged-out users.
+- Post URLs work but custom post types, archives or paginated URLs 404.
+- Google reports 404s for URLs that look correct in the sitemap.
+- After a migration, old URLs 404 instead of redirecting.
+
+## Possible Causes
+
+1. The content really is gone (trash, deleted category, unpublished) or its slug changed.
+2. Rewrite rules missing/not flushed — the request never reaches WordPress' routing ([permalinks article](/wordpress/permalinks-404)).
+3. Cached 404 served by the page cache, CDN or browser from before the content existed.
+4. A redirect rule (plugin/server) pointing at a target that no longer exists → chain ending in 404.
+5. Custom post type registered with `public => false` or a rewrite slug mismatch.
+6. Multisite: wrong site/domain mapping for the requested host.
+7. A security plugin hiding content from anonymous visitors, returning 404 to avoid leaking existence.
+
+## Prerequisites
+
+- The URL, the status code, and whether the content still exists in wp-admin.
+- Access to the page cache/CDN to purge, and to the `.htaccess`/vhost for rules.
+- For migrations: the old URL inventory (exports, sitemaps, analytics).
+
+## Investigation
+
+1. **Check the content, then the layers.**
+
+```bash
+curl -sSI https://example.com/sample-page/ | head -6
+wp post list --post_type=page --fields=ID,post_name,post_status | grep -i sample
+wp rewrite list --match=/sample-page/ | head -5
+```
+
+2. **Verify WordPress routing actually runs** by checking the rewrite rules and flushing them.
+
+```bash
+wp option get permalink_structure
+wp rewrite flush --hard
+```
+
+3. **Test with cache bypass and as a logged-out user.**
+
+```bash
+curl -sS -o /dev/null -w '%{http_code}\n' "https://example.com/sample-page/?nocache=$(date +%s)"
+```
+
+4. **Follow the redirect chain** if there is one — many 404s are the last hop of a broken redirect.
+
+```bash
+curl -sSIL https://example.com/old-url/ | grep -Ei '^(HTTP/|location)'
+```
+
+5. **Check for host mismatch** (www/non-www, http/https, staging domain left in the database).
+
+```bash
+wp option get siteurl && wp option get home
+```
+
+## Diagnosis
+
+| Observation | Cause | Fix |
+| --- | --- | --- |
+| Content exists, 404 persists after flush | cache or server rules | purge caches, verify rewrite rules |
+| Only anonymous visitors get 404 | security plugin / caching | check plugin rules and cache keys |
+| Redirect chain ends in 404 | target deleted | repoint the redirect to a live URL |
+| Only some post types 404 | CPT registration slug | fix `rewrite` args and flush |
+| Works with `?p=123` | rewrite layer | restore permalink rules |
+| All URLs 404 except homepage | vhost/server mapping | fix document root/`try_files` |
+| Random 404s behind CDN | cached negative responses | purge, add bypass for no-cache cookies |
+
+::: investigate
+Investigation mindset: a 404 has two very different homes — "the content is not there" and "the request never reached the content". One `wp post list` plus one `curl` separates them in under a minute.
+:::
+
+## Resolution
+
+1. **Restore the content or the slug** if the 404 is legitimate: republish, fix the slug, or restore from trash (WordPress keeps the old slug in `_wp_old_slug` and redirects automatically for posts).
+2. **Fix the rewrite layer**: restore the WordPress block, flush rules, resave permalinks ([Apache](/apache/htaccess) / [NGINX](/nginx/wordpress-rewrites)).
+3. **Repair broken redirects**: point them at live targets, and consolidate chains to a single hop.
+4. **Purge caches** including negative caching at the CDN, then verify with cache-busters.
+5. **After a migration, build a redirect map**: export old URLs (sitemap/crawl/analytics), match them to new ones, and implement 301s at one layer (plugin or server, not both).
+6. **Monitor the outcome**: watch 404 rate in the access log and Search Console for a week after the change.
+
+## Verification
+
+- The affected URLs return 200 with correct content for logged-out users.
+- No 404 entries for those URLs in the access log after a purge.
+- Redirects return exactly one 301 or 302 and then 200.
+- Sitemap URLs all return 200 in a bulk check.
+
+## Root Cause
+
+404 is an answer, not an error class: the server or WordPress reached the routing stage and found no handler. Either the content is absent or the routing/config preventing discovery.
+
+## Prevention
+
+- Keep slugs stable, or implement redirects when changing them.
+- Add a 404-rate check to release verification and post-migration monitoring.
+- Cache 404s for very short periods if at all (negative caching hides fixes).
+- Keep the redirect map in version control alongside the site code.
+
+## Related Articles
+
+- [/wordpress/permalinks-404](/wordpress/permalinks-404)
+- [/errors/err-too-many-redirects](/errors/err-too-many-redirects)
+- [/migration/migrate-wordpress-site](/migration/migrate-wordpress-site)
+- [/nginx/wordpress-rewrites](/nginx/wordpress-rewrites)
+
+## Official References
+
+- [WordPress: Using permalinks](https://wordpress.org/documentation/article/using-permalinks/)
+- [Google: 301 redirects](https://developers.google.com/search/docs/crawling-indexing/301-redirects)
+- [Apache: mod_rewrite](https://httpd.apache.org/docs/2.4/mod/mod_rewrite.html)

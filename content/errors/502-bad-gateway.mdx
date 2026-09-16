@@ -1,0 +1,133 @@
+---
+title: "502 Bad Gateway"
+description: "The proxy reached nothing usable. Triage PHP-FPM, upstream timeouts, memory kills and CDN-to-origin problems with the right log lines."
+difficulty: Advanced
+timeToFix: "20–90 min"
+appliesTo: [NGINX, PHP-FPM, CDN, Hosting]
+tags: [nginx, hosting, php, logs, gateway]
+severity: Critical
+updated: 2026-01-09
+---
+
+## Symptoms
+
+- `502 Bad Gateway` (NGINX, LiteSpeed, Cloudflare variant: "502 Bad Gateway / web server is down").
+- Intermittent: some requests succeed, others fail — often under load or on a specific heavy page.
+- The error can affect only dynamic requests; static files still return 200.
+- Admin, checkout or a heavy admin screen fails first.
+
+## Possible Causes
+
+1. PHP-FPM pool exhausted (`pm.max_children` reached), so the upstream returns nothing.
+2. PHP-FPM worker killed by the OOM killer or by a host memory limit.
+3. PHP-FPM socket misconfigured: wrong socket path, permissions, or a pool that did not start after a deploy/restart.
+4. `fastcgi_read_timeout` / `proxy_read_timeout` shorter than the request duration.
+5. A plugin doing a synchronous outbound API call that hangs (no timeout configured).
+6. A CDN in front returning 502 because the origin refused the connection (firewall/WAF blocking the CDN IPs).
+7. PHP-FPM crashed due to a broken extension after a PHP version change.
+
+## Prerequisites
+
+- Server log access (NGINX/Apache error log, PHP-FPM log) — this article is log-first by nature.
+- Panel access for PHP-FPM restart and PHP version/limits.
+- The failing URL plus timestamps, ideally with a couple of examples spread over time.
+
+## Investigation
+
+1. **Pin down the failure boundary**: which URLs, how often, and whether static assets are affected.
+
+```bash
+curl -sSI https://example.com/wp-content/themes/active/style.css | head -3
+curl -sS -o /dev/null -w '%{http_code} %{time_total}s\n' https://example.com/?nocache=$RANDOM
+```
+
+2. **Read the upstream error line** — it names the mechanism.
+
+```bash
+tail -n 200 /var/log/nginx/error.log | grep -Ei 'upstream|fastcgi|502|timeout|refused|no live upstreams'
+# LiteSpeed: /usr/local/lsws/logs/error.log or the panel's error log viewer
+```
+
+3. **Check the PHP-FPM side** for saturation and crashes.
+
+```bash
+systemctl status php8.2-fpm
+php-fpm -t                                   # config test
+grep -Ei 'max_children|max_requests|listen' /etc/php/8.2/fpm/pool.d/*.conf
+journalctl -u php8.2-fpm --since '1 hour ago' | tail -40
+```
+
+4. **Look for OOM kills** — the classic silent cause on small VPS or busy shared plans.
+
+```bash
+dmesg -T | grep -i 'killed process' | tail -10
+grep -i 'out of memory' /var/log/syslog | tail -10
+```
+
+5. **Measure the response time of the failing request** to compare against the configured timeout.
+
+```bash
+time curl -sS -o /dev/null -w '%{http_code} in %{time_total}s\n' https://example.com/checkout/
+```
+
+6. **If a CDN is in front**, test the origin directly to prove which hop failed.
+
+```bash
+dig +short example.com A
+curl -sSI --resolve example.com:443:ORIGIN_IP https://example.com/ | head -5
+```
+
+::: investigate
+Investigation mindset: a 502 is a *gap in the chain* — the proxy could not get a usable answer. Your first task is naming the hop that failed (proxy → FPM, or CDN → server), the second is naming the resource that ran out.
+:::
+
+## Diagnosis
+
+| Log signature | Mechanism | Fix |
+| --- | --- | --- |
+| `connect() failed (111: Connection refused)` to the FPM socket | FPM down or wrong socket | Start/restart FPM, correct the socket path |
+| `upstream timed out (110: Connection timed out)` | request longer than timeout | raise timeout, but fix the slow code path |
+| `no live upstreams while connecting to upstream` | all workers busy/unavailable | raise `pm.max_children`, reduce work per request |
+| OOM kill around the incident | memory pressure | raise memory, reduce worker count/size, cache |
+| 502 only from CDN | origin blocking CDN IPs | whitelist CDN ranges or correct SSL mode |
+| 502 on one heavy page repeatedly | plugin/API call hanging | add timeouts, offload to a background job |
+
+## Resolution
+
+1. **Restore service first**: restart PHP-FPM and the web server, then confirm 200s on the affected URL.
+2. **Resize the pool** based on measured process size rather than guesswork: `pm.max_children ≈ available_ram / average_php_process_size`.
+3. **Raise timeouts only with a plan** (imports, exports, long reports) and move genuinely long jobs to cron or a queue.
+4. **Fix the hanging dependency**: set explicit timeouts in outbound calls, add retries with backoff, and cache responses.
+5. **Reduce per-request work**: page/object caching, fewer autoloaded options, fewer redirects, less admin-ajax traffic.
+6. **CDN-side**: whitelist origin access, check SSL mode, and ensure the origin is not rate-limiting edge nodes.
+
+## Verification
+
+- Sustained success: 200 responses on the affected URLs under normal traffic, not just on a single test.
+- FPM active children stay below the pool limit during a load test.
+- No new 502 lines in the error log for at least an hour.
+- Response times comfortably below the configured timeout.
+
+## Root Cause
+
+502 comes from a hop that failed to deliver: the upstream was unavailable or too slow. Root causes are always one of three: process availability, resource saturation, or a timeout without a plan.
+
+## Prevention
+
+- Alert on 5xx rate and on PHP-FPM `listen queue` saturation, not only on total downtime.
+- Avoid synchronous external calls in user-facing requests; make them background jobs with timeouts.
+- Keep a documented sizing formula for `pm.max_children`, memory limits and worker count.
+- Load test before campaigns; a 502 under Black Friday is a sizing ticket you can predict.
+
+## Related Articles
+
+- [/errors/503-service-unavailable](/errors/503-service-unavailable)
+- [/nginx/wordpress-rewrites](/nginx/wordpress-rewrites)
+- [/performance/ttfb](/performance/ttfb)
+- [/runbooks/site-down](/runbooks/site-down)
+
+## Official References
+
+- [NGINX: upstream module](https://nginx.org/en/docs/http/ngx_http_upstream_module.html)
+- [PHP-FPM: pool configuration](https://www.php.net/manual/en/install.fpm.configuration.php)
+- [Cloudflare: 502 troubleshooting](https://developers.cloudflare.com/support/troubleshooting/http-status-codes/cloudflare-5xx-errors/)

@@ -1,0 +1,147 @@
+---
+title: "WP-Cron Not Running (Scheduled Posts, Emails, Cleanups)"
+description: "Scheduled posts publish late, renewal emails never send, Action Scheduler queues grow. Here is how to verify cron end to end and move to real server cron."
+difficulty: Intermediate
+timeToFix: "20–60 min"
+appliesTo: [WordPress Core, WooCommerce, Hosting]
+tags: [cron, hosting, woocommerce, logs, performance]
+severity: Medium
+updated: 2026-01-05
+---
+
+## Symptoms
+
+- Scheduled posts publish hours late, or only when someone visits the site.
+- Subscription renewals, backorder notifications and trial-expiry emails never send.
+- WooCommerce → Status shows a growing "pending" count in Scheduled Actions.
+- Cache plugins report "cron is late"; Site Health flags a scheduled event as overdue.
+- `wp-cron.php` returns 200 but the site's events stay due.
+
+## Possible Causes
+
+1. `DISABLE_WP_CRON` is set to true but no real server cron is calling `wp-cron.php`.
+2. Port 80/443 blocked from the server itself, so the loopback request that triggers cron fails.
+3. Basic auth, a firewall or a WAF blocking the internal cron request.
+4. Cron timeouts: the event runs, hits `max_execution_time`, and dies without rescheduling.
+5. A plugin registering a huge number of events, so each run cannot finish inside the request window.
+6. Server cron misconfigured (wrong PHP binary, wrong user, missing `--path`, wrong schedule).
+7. Object cache or transients masking the issue: events look "done" but stale keys remain.
+
+## Prerequisites
+
+- Panel or SSH access to view/edit cron jobs.
+- Ability to run WP-CLI (strongly preferred for verification).
+- The list of integrations that depend on cron: WooCommerce, LMS, SEO sitemaps, backups, email marketing.
+
+## Investigation
+
+1. **Inventory the event queue.**
+
+```bash
+wp cron event list --fields=hook,next_run_gmt,recurrence --format=table | head -40
+wp cron event list --due-now --fields=hook,next_run_gmt
+wp option get cron --format=json | head -c 600
+```
+
+2. **Test whether WP-Cron can be triggered from the web.**
+
+```bash
+curl -sS -o /dev/null -w '%{http_code} %{time_total}s\n' "https://example.com/wp-cron.php?doing_wp_cron=$(date +%s)"
+wp cron event run --due-now --path=/home/user/public_html
+```
+
+3. **Check the configuration and the server cron (if any).**
+
+```bash
+wp config get DISABLE_WP_CRON
+crontab -l | grep -i cron
+ls -la /etc/cron.d/ | head
+```
+
+4. **Look for fatal errors during cron runs** — they explain "it runs but nothing happens".
+
+```bash
+grep -iE 'cron|fatal|timeout' ~/logs/php_error.log | tail -30
+```
+
+5. **For WooCommerce, inspect Action Scheduler health** rather than guessing.
+
+```bash
+wp action-scheduler run --batch=20     # if the CLI command is available
+wp option get wc_queue_health 2>/dev/null
+```
+
+6. **Confirm the server clock and PHP timezone** — scheduled posts publish "late" when the site clock is wrong.
+
+```bash
+date && wp eval 'echo wp_timezone_string()."\n";'
+```
+
+## Diagnosis
+
+| Observation | Mechanism | Fix |
+| --- | --- | --- |
+| `DISABLE_WP_CRON` true, `crontab -l` empty | cron disabled, no replacement | add a server cron job |
+| `wp-cron.php` returns 401/403 | auth/WAF blocking loopback | allow loopback or use server cron |
+| Events run only after a page visit | normal WP-Cron behaviour with low traffic | switch to server cron |
+| Events due-now never process | timeouts or a fatal per event | run one hook manually and read the error |
+| Thousands of pending actions | backlog after cron outage | batch-run the queue, then monitor |
+| Posts publish at odd hours | timezone / clock skew | fix timezone, verify with `date` |
+
+::: investigate
+Investigation mindset: "cron is broken" almost always means "nothing is triggering it" or "each run is too big". Prove triggering first — do not start optimising hooks before you know the scheduler starts at all.
+:::
+
+## Resolution
+
+1. **Switch to a real cron job** for any production site — deterministic, logged and independent of traffic.
+
+```bash
+# every 15 minutes, as the site user (cPanel: "Cron Jobs" UI does the same)
+*/15 * * * * /usr/local/bin/php /home/user/public_html/wp-cron.php >/dev/null 2>&1
+# or better, with WP-CLI so you get log output
+*/15 * * * * cd /home/user/public_html && /usr/local/bin/wp cron event run --due-now >> /home/user/logs/wpcron.log 2>&1
+```
+
+2. **Set `DISABLE_WP_CRON` to true only after** the server cron exists and works.
+3. **Clear a backlog in batches** rather than one giant run.
+
+```bash
+wp cron event run --due-now
+wp action-scheduler run --batch=50   # repeat until the queue drains
+```
+
+4. **Fix timeouts**: increase `max_execution_time` for the CLI runs, and split heavy hooks into smaller chunks or schedule them off-peak.
+5. **Fix the failing hook** identified in the log (broken API key, fatal in a plugin, an expired license).
+6. **Verify that scheduled posts and emails resume** with a controlled test: schedule a post 5 minutes out and watch it publish.
+
+## Verification
+
+- `wp cron event list --due-now` is empty after a cron cycle.
+- Action Scheduler shows a healthy status with a decreasing pending count.
+- A test scheduled post publishes within 1–2 minutes of its configured time.
+- `wpcron.log` shows successful runs with no fatals for 24 hours.
+
+## Root Cause
+
+WP-Cron is not a scheduler: it is triggered by incoming requests. Low-traffic or non-public sites therefore stop running their own maintenance, and long jobs die at the request timeout.
+
+## Prevention
+
+- Configure real server cron during every build/provision, and document the interval.
+- Monitor: alert when due events are older than 30 minutes, or when the Action Scheduler backlog grows.
+- Keep hooks idempotent and quick; move heavy work into chained, batched jobs.
+- Include a cron check in the pre-launch and incident checklists ([/checklists/pre-launch](/checklists/pre-launch)).
+
+## Related Articles
+
+- [/woocommerce/order-emails-not-sending](/woocommerce/order-emails-not-sending)
+- [/woocommerce/cart-session-lost](/woocommerce/cart-session-lost)
+- [/hosting/cpanel](/hosting/cpanel)
+- [/performance/object-cache](/performance/object-cache)
+
+## Official References
+
+- [Plugin Handbook: Cron](https://developer.wordpress.org/plugins/cron/)
+- [WP-CLI: cron event run](https://developer.wordpress.org/cli/commands/cron/event/run/)
+- [WooCommerce: Action Scheduler](https://woocommerce.com/document/action-scheduler-faq/)

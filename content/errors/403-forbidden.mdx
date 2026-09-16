@@ -1,0 +1,130 @@
+---
+title: "403 Forbidden"
+description: "Access denied by a rule you cannot see in WordPress. Separate permissions, .htaccess, mod_security, WAF and account suspension in four steps."
+difficulty: Intermediate
+timeToFix: "15–45 min"
+appliesTo: [Hosting, Permissions, WAF, CDN]
+tags: [security, hosting, permissions, apache, logs]
+severity: High
+updated: 2026-01-12
+---
+
+## Symptoms
+
+- "403 Forbidden", "You don't have permission to access this resource" (Apache), or "403 ERROR — The request could not be satisfied" (CloudFront).
+- Often limited to one path: images in `wp-content/uploads`, a specific admin page, REST requests or `/wp-json/wc/v3/`.
+- Sometimes `403` only for anonymous visitors, while logged-in admins are fine.
+- Uploads may succeed through the media library but fail for a plugin writing to the same folder.
+
+## Possible Causes
+
+1. File/directory mode or ownership wrong (e.g. `600` on a directory, or root-owned files after a manual copy).
+2. `.htaccess` deny rules: `Require all denied`, IP allowlists, hotlink protection.
+3. `mod_security` / WAF rule blocking the request signature (very common for REST and admin-ajax).
+4. Hosting-level protections: "prevent hotlinking", suspended account, or a security policy in `.user.ini`.
+5. CDN rules: bot fight mode, blocked user agent, or a blocked country.
+6. Missing `index.php`/directory listing disabled with no index file.
+7. Database-driven deny: a security plugin's whitelist only allows certain IPs.
+
+## Prerequisites
+
+- SSH/SFTP or File Manager to inspect permissions.
+- Panel access for logs (Apache/Nginx error log, mod_security audit log).
+- The exact URL, HTTP status, response headers and timestamp of the failure.
+
+## Investigation
+
+1. **Reproduce precisely and capture headers** — the `Server` header tells you which layer answered, and WAF blocks often carry a fingerprint.
+
+```bash
+curl -sSI https://example.com/wp-content/uploads/2026/01/photo.jpg
+curl -sSI "https://example.com/wp-json/wp/v2/posts"
+curl -sS -D - -o /dev/null https://example.com/wp-admin/ | grep -Ei 'server|cf-|x-'
+```
+
+2. **Check permissions and ownership** on the failing path.
+
+```bash
+ls -la wp-content/uploads
+stat -c '%a %U:%G %n' wp-content uploads wp-config.php
+namei -l $(pwd)/wp-content/uploads
+find wp-content/uploads -maxdepth 2 -perm -u-x -type d | head
+```
+
+3. **Rule out `.htaccess`** by temporarily renaming it (never leave it renamed) and retesting the same URL.
+
+```bash
+mv .htaccess .htaccess.bak && curl -sSI https://example.com/wp-content/uploads/ | head -3
+```
+
+4. **Read the server log for the rule that blocked it.**
+
+```bash
+grep ' 403 ' ~/logs/*access*.log | tail -20
+tail -n 100 ~/logs/error_log | grep -i 'client denied\|mod_security\|AH01630'
+```
+
+5. **Test the same request from a different network/IP** to distinguish an IP-based rule from a path rule.
+
+6. **Check the CDN/WAF dashboard** for blocked events on that path in the same minute and note the rule ID.
+
+## Diagnosis
+
+| Observation | Cause | Fix layer |
+| --- | --- | --- |
+| 403 disappears after renaming `.htaccess` | deny/allowlist rule | server config |
+| Log shows `AH01630: client denied by server configuration` | directory block | Apache config or `.htaccess` |
+| mod_security audit entry with rule id 9xxxxx | WAF signature | rule exclusion upstream |
+| 403 only from your IP | IP allowlist / country block | firewall |
+| 403 on uploads only, modes look fine | hotlink/referrer protection | panel setting |
+| Succeeds via CLI, fails via web | account-level restriction | host ticket |
+
+## Resolution
+
+1. Fix modes and ownership first, because it is both the most common cause and the least disruptive fix.
+
+```bash
+find wp-content/uploads -type d -exec chmod 755 {} \;
+find wp-content/uploads -type f -exec chmod 644 {} \;
+chown -R accountuser:accountgroup wp-content/uploads
+```
+
+2. Update `.htaccess` to narrow the deny to what you actually need — never leave a blanket `Require all denied` in the site root.
+3. For mod_security/WAF blocks: add a targeted exclusion for the legitimate endpoint, or switch the rule from block to log to observe first.
+4. For hotlink protection: whitelist the site's own domains and any CDN origin.
+5. Host-level suspension or policy: escalate with evidence — the URL, timestamp, status, log line and the fact that it affects legitimate admin traffic.
+
+::: warning
+Do not "fix" a 403 with `chmod -R 777`. Take the extra two minutes to correct ownership: a world-writable WordPress is a malware invitation, and security scanners will treat it as a finding.
+:::
+
+## Verification
+
+- The exact URL returns 200/206 with the expected content type.
+- Media upload, REST request and admin page all work as a logged-out user.
+- No new 403 entries for legitimate endpoints in the log after the change.
+- Security headers still present (the fix did not disable your protections).
+
+## Root Cause
+
+403 is an authorisation decision made *before* WordPress runs, which is why WordPress plugins/debug logs are usually silent. The decision belongs to filesystem modes, web server rules, WAF or the hosting account.
+
+## Prevention
+
+- Standardise permissions and add a weekly scan for world-writable files.
+- Document WAF exclusions for `admin-ajax.php`, `wp-json` and `/wc-ajax/` before enabling aggressive rules.
+- Ask the host to notify (not block silently) when a rule triggers on admin traffic.
+- Add a 403 spike check to incident monitoring — it is often the first symptom of a misconfigured rule deploy.
+
+## Related Articles
+
+- [/security/file-permissions](/security/file-permissions)
+- [/apache/htaccess](/apache/htaccess)
+- [/hosting/cpanel](/hosting/cpanel)
+- [/security/brute-force](/security/brute-force)
+
+## Official References
+
+- [Apache: Access control (Require)](https://httpd.apache.org/docs/2.4/howto/access.html)
+- [WordPress: File permissions](https://developer.wordpress.org/advanced-administration/server/file-permissions/)
+- [Cloudflare: Firewall rules](https://developers.cloudflare.com/waf/)

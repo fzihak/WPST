@@ -1,0 +1,130 @@
+---
+title: "Allowed Memory Size Exhausted"
+description: "\"Allowed memory size of N bytes exhausted\" explained: raise the limit to unblock, but find the call site — otherwise the ticket comes back next month."
+difficulty: Intermediate
+timeToFix: "20–60 min"
+appliesTo: [PHP, WordPress Core, Plugins, Hosting]
+tags: [php, memory, hosting, performance, fatal-error]
+severity: High
+updated: 2026-01-16
+featured: true
+---
+
+## Symptoms
+
+- Fatal error text: `Allowed memory size of 268435456 bytes exhausted (tried to allocate 20480 bytes) in /path/file.php on line 123`.
+- Backend actions fail first: uploading an image, saving a page builder layout, importing a WooCommerce CSV, running an export, bulk-editing.
+- Admin shows "The site is experiencing technical difficulties" while the frontend is fine.
+- `500` on cron-triggered requests, or `/wp-cron.php` producing the same fatal.
+
+## Possible Causes
+
+1. `memory_limit` genuinely too low for a heavy operation (imports, builders, PDF generation).
+2. A runaway loop or an infinite recursion (a filter calling itself, a hook firing on its own output).
+3. A single plugin loading huge data into memory (all posts, all products, a full image library).
+4. `WP_MEMORY_LIMIT` below the PHP limit, so WordPress "raises" it to a value still too small.
+5. A bloated autoloaded option or post meta behemoth (page-builder metadata, SEO index tables).
+6. Host-level cap: the panel setting is ignored because the host enforces a hard ceiling.
+
+## Prerequisites
+
+- The full fatal message with file path and line number (the allocation size hints at what it was doing).
+- Panel access to PHP settings, or `wp-config.php` edit rights.
+- A staging copy for reproducing imports and exports safely.
+
+## Investigation
+
+1. **Read the whole fatal, not the first line.** `tried to allocate 20480 bytes` on an upload means one more chunk was needed; on a loop it is often tiny.
+
+```bash
+grep -i 'memory' ~/logs/php_error.log | tail -10
+```
+
+2. **See the effective limits** — three different values can be in play (PHP, WordPress constant, host cap).
+
+```bash
+wp eval 'echo "php=".ini_get("memory_limit")." wp=".WP_MEMORY_LIMIT." max=".WP_MAX_MEMORY_LIMIT."\n";'
+php -i | grep -i memory_limit
+curl -sS https://example.com/wp-admin/site-health.php?tab=debug | grep -i memory
+```
+
+3. **Identify the call site** from the stack trace, or with Query Monitor: the file path usually names the plugin.
+
+4. **Reproduce with a memory ceiling** to prove which plugin needs it.
+
+```bash
+wp eval 'echo ini_get("memory_limit");' --user=1
+wp plugin deactivate --all && wp plugin list --status=active
+```
+
+5. **Check for a loop** when the fatal happens on a page that should be cheap (blog listing, single post).
+
+```bash
+wp eval 'global $wp_filter; foreach ($wp_filter as $hook => $obj) { foreach ($obj->callbacks as $prio => $cbs) { if (count($cbs) > 6) echo "$hook @ $prio → ".count($cbs)."\n"; } }'
+```
+
+## Diagnosis
+
+| Signal | Likely mechanism | Test |
+| --- | --- | --- |
+| Fatal only during an import/export | genuine peak usage | raise limit + batches |
+| Fatal on many different URLs | loop or autoload bloat | Query Monitor, disable suspects |
+| Fatal with `tried to allocate` > 1 MB | loading a blob (option/meta) | find the large option |
+| Admin fine, frontend fatal | theme/builder template | switch theme temporarily |
+| `wp-cron.php` fatal each hour | a scheduled heavy job | inspect `wp cron event list` |
+
+```sql
+SELECT option_name, LENGTH(option_value) AS bytes, autoload
+FROM wp_options ORDER BY bytes DESC LIMIT 15;
+```
+
+## Resolution
+
+1. **Unblock immediately** with a correctly-scoped limit.
+
+```php
+// wp-config.php
+define( 'WP_MEMORY_LIMIT', '256M' );      // frontend baseline
+define( 'WP_MAX_MEMORY_LIMIT', '512M' );  // admin, cron, imports
+```
+
+2. **Set the PHP limit at the right layer** — panel selects it, `.user.ini`/`php.ini` for PHP-FPM hosts, `php_value` only under mod_php (see [/php/memory-limit](/php/memory-limit)).
+3. **Restart PHP-FPM / purge OPcache** where required, then confirm with `php -i`.
+4. **Fix the mechanism**: batch the import (run in chunks of 100–500 rows), add pagination to the admin screen, cache the expensive query, or remove the plugin that loads everything at once.
+5. **Clean the data**: delete expired transients, revoke orphaned cron events, trim revisions, and audit oversized autoloaded options.
+6. If the host enforces a hard ceiling below your need, document it and move the heavy operation off the shared environment.
+
+::: warning
+Raising the limit without finding the call site is a debt. If a page needs 512M to render a blog listing, the next traffic spike will produce a 500 for visitors instead of a fatal for you.
+:::
+
+## Verification
+
+- Re-run the exact original operation (import, save, upload) to completion.
+- Peak memory observed in Query Monitor stays comfortably below the limit.
+- No new `memory exhausted` entries after a full day, including cron windows.
+- Frontend TTFB is not worse than before the change.
+
+## Root Cause
+
+Requests are billed to a per-request memory budget. Peak usage is driven by data volume × how much of it a single request loads eagerly. Both sides are fixable; only one of them is fixed by editing a config value.
+
+## Prevention
+
+- Size limits by workload type: WooCommerce/LMS 512M, brochure sites 256M, builders add ~128M.
+- Monitor memory peaks per page template rather than waiting for fatals.
+- Convert imports and exports to chunked jobs (Action Scheduler or WP-CLI in batches).
+- Keep a `wp options` size audit in the quarterly performance checklist ([/checklists/performance](/checklists/performance)).
+
+## Related Articles
+
+- [/php/memory-limit](/php/memory-limit)
+- [/errors/500-internal-server-error](/errors/500-internal-server-error)
+- [/performance/object-cache](/performance/object-cache)
+- [/checklists/performance](/checklists/performance)
+
+## Official References
+
+- [PHP: runtime configuration (memory_limit)](https://www.php.net/manual/en/ini.core.php)
+- [WordPress: editing wp-config.php](https://developer.wordpress.org/advanced-administration/wordpress/wp-config/)
+- [WordPress: Site Health](https://developer.wordpress.org/advanced-administration/security/site-health/)

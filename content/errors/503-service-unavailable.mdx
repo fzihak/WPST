@@ -1,0 +1,130 @@
+---
+title: "503 Service Unavailable"
+description: "Load shedding, maintenance mode and deliberate back-pressure: how to tell a capacity problem from a maintenance screen, and what to fix first."
+difficulty: Intermediate
+timeToFix: "15–60 min"
+appliesTo: [Hosting, WordPress Core, CDN]
+tags: [hosting, performance, cdn, logs, maintenance]
+severity: High
+updated: 2026-01-08
+---
+
+## Symptoms
+
+- `503 Service Unavailable` with or without `Retry-After`; sometimes a branded maintenance page.
+- Frequently accompanied by the host's "resources exceeded" notice or a WAF "Under Attack Mode" interstitial.
+- Works for admins, fails for visitors — or works on some nodes and not others.
+- WooCommerce checkout fails while the catalogue still loads.
+
+## Possible Causes
+
+1. Hosting account over its CPU/RAM/process limits, triggering automated throttling.
+2. WordPress maintenance mode: `.maintenance` file present in the root from an interrupted update.
+3. A caching plugin deliberately returning 503 for "cache warming" or a WAF rate limit.
+4. Capacity exhaustion: PHP workers maxed, MySQL connections maxed, or queue backlog.
+5. A CDN WAF action (e.g. "Under Attack Mode", bot fight, or a rate-limit rule).
+6. Scheduled maintenance by the hosting provider or a planned deployment window.
+7. A plugin putting the site into maintenance mode during migrations (search-replace tools).
+
+## Prerequisites
+
+- Hosting panel access and, ideally, host status page/subscription.
+- Access to the response body of the 503 — maintenance pages and WAF pages look very different.
+- Presence at the site: admins often bypass 503, so test logged out.
+
+## Investigation
+
+1. **Capture the actual 503 response** including headers and body.
+
+```bash
+curl -sS -D - https://example.com/ -o body.html | head -20
+head -c 400 body.html
+curl -sSI https://example.com/uploads/ 2>/dev/null | head -5
+```
+
+2. **Look for maintenance mode.**
+
+```bash
+ls -la wp-content/.maintenance .maintenance 2>/dev/null
+wp maintenance-mode status
+```
+
+3. **Check the capacity signals host-side.**
+
+```bash
+uptime
+ps -eo pmem,rss,cmd --sort=-rss | head -12
+ls /home/user/logs/ | head
+grep -i 'resource\|limit\|suspend' ~/logs/*.log | tail -20
+```
+
+4. **Count concurrent PHP processes and DB connections** to confirm saturation rather than an arbitrary block.
+
+```sql
+SHOW STATUS LIKE 'Threads_connected';
+SHOW VARIABLES LIKE 'max_connections';
+```
+
+5. **Scan the access log for the traffic shape** — 503s caused by bots look different from those caused by real spikes.
+
+```bash
+awk '{print $1}' access.log | sort | uniq -c | sort -rn | head
+grep ' 503 ' access.log | tail -20
+```
+
+6. **Check the CDN/WAF** for the current security level and rate-limit rules; "Under Attack Mode" produces 503s for legitimate visitors by design.
+
+## Diagnosis
+
+| Observation | Cause | Next step |
+| --- | --- | --- |
+| `.maintenance` file exists | interrupted update | remove file, then complete the update |
+| Response body is the host's limit page | account throttling | reduce load, upgrade plan, or cache |
+| 503 with `Retry-After` only under load | queue/back-pressure | scale, cache, or shed load |
+| 503 from a specific IP range | rate limit | tune rule, verify with a real visitor flow |
+| Works logged in, fails logged out | caching/WAF rule | fix the rule, check cache bypass headers |
+| Host status page reports an incident | provider outage | communicate, wait, keep evidence |
+
+::: investigate
+Investigation mindset: 503 is usually *intentional*. Something is shedding load, enforcing a limit, or serving a maintenance page. Find the decision-maker — hosting policy, plugin, or edge rule — before optimising anything.
+:::
+
+## Resolution
+
+1. **Clear WordPress maintenance mode** if a `.maintenance` file is stale, then re-run the interrupted update cleanly on staging first.
+2. **Reduce load per request** to get under the limit: enable page cache, object cache, disable heavy admin-ajax polling, and remove aggressive autoloaded options.
+3. **Mitigate a bot flood** at the edge: rate-limit `/wp-login.php` and `wp-cron.php`, challenge suspicious user agents, and cache anonymous traffic.
+4. **Right-size the plan** when limits are legitimate: document measured peaks, then upgrade CPU/RAM/worker counts rather than repeatedly retrying.
+5. **Coordinate planned maintenance** with real pages: set expectations, serve an informative 503 with `Retry-After`, and exclude admin paths.
+6. **WAF**: confirm the security level is appropriate, then add exceptions for legitimate endpoints (checkout, REST, cart fragment requests).
+
+## Verification
+
+- 503 rate returns to zero for logged-out traffic over a full traffic cycle.
+- Peak resource usage sits below the account limits with headroom.
+- Checkout, login and search all work as a visitor when traffic is at daily peak.
+- No maintenance files or stale flags remain after the fix.
+
+## Root Cause
+
+503 signals deliberate unavailability: capacity protection, maintenance, or an edge decision. Differentiating the three is the entire diagnostic task.
+
+## Prevention
+
+- Keep cache layers healthy so spikes do not become outages.
+- Alert on 503 rate, not only on hard downtime, and include the response body in the alert payload.
+- Document a maintenance procedure that cannot strand the site in maintenance mode (with a reminder to `wp maintenance-mode deactivate`).
+- Review hosting limits against real peaks each quarter ([/checklists/performance](/checklists/performance)).
+
+## Related Articles
+
+- [/errors/502-bad-gateway](/errors/502-bad-gateway)
+- [/wordpress/update-failed](/wordpress/update-failed)
+- [/performance/ttfb](/performance/ttfb)
+- [/runbooks/site-down](/runbooks/site-down)
+
+## Official References
+
+- [RFC 9110: 503 Service Unavailable](https://www.rfc-editor.org/rfc/rfc9110.html#name-503-service-unavailable)
+- [WordPress: Updating WordPress](https://developer.wordpress.org/advanced-administration/upgrade/updating/)
+- [Cloudflare: Under Attack Mode](https://developers.cloudflare.com/fundamentals/reference/under-attack-mode/)

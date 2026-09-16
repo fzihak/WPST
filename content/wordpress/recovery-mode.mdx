@@ -1,0 +1,116 @@
+---
+title: "Recovery Mode: Getting Back Into a Broken Site"
+description: "WordPress' built-in escape hatch when a plugin or theme fatals. How the email link works, when it expires, and the recovery steps to take once you are in."
+difficulty: Beginner
+timeToFix: "5–20 min"
+appliesTo: [WordPress Core, Plugins, Themes]
+tags: [recovery, debug, plugin, fatal-error, admin]
+severity: Medium
+updated: 2026-01-06
+---
+
+## Symptoms
+
+- wp-admin is blank or shows "There has been a critical error", so you cannot deactivate the plugin that broke the site.
+- The admin email received a message titled "Your Site is Experiencing a Technical Issue" with a recovery link.
+- The link appears expired, or the email never arrived because SMTP is broken too.
+
+## Possible Causes
+
+1. A plugin/theme fatal triggered the fatal error handler, enabling Recovery Mode for admins.
+2. The recovery email bounced or went to spam (no SMTP configured, or a mailbox that is monitored by nobody).
+3. The token expired: recovery links are valid for 7 days (24 hours before WordPress 6.8's long-lived link).
+4. The email address on the site is stale, so no one can receive it.
+
+## Prerequisites
+
+- A way to know the admin email (database, or a contact who can read it).
+- FTP/SFTP as the guaranteed fallback — Recovery Mode depends on email, which is a dependency that can fail.
+- The site URL, in case you need to construct the recovery URL manually.
+
+## Investigation
+
+1. **Locate and use the recovery link.** The URL pattern is stable:
+
+```text
+https://example.com/wp-login.php?action=enter_recovery_mode&rm_token=TOKEN&rm_key=KEY
+```
+
+2. **Check whether an email was even generated** and where it went.
+
+```bash
+wp option get admin_email
+tail -n 100 wp-content/debug.log | grep -i 'recovery'
+# If SMTP is broken, check the mail log on the server or the provider's outbound log
+```
+
+3. **If no email is available, derive everything you need from the database.** Recovery Mode uses keys stored in `wp_options`.
+
+```sql
+SELECT option_name, LEFT(option_value, 80) FROM wp_options WHERE option_name LIKE '%recovery_mode%';
+```
+
+4. **Verify the fatal is in plugin/theme code** (Recovery Mode only covers those; core fatals are not recoverable this way).
+
+```bash
+grep -i 'PHP Fatal' ~/logs/php_error.log | tail -10
+```
+
+5. **Fall back to filesystem isolation** when email is unusable — this works every time.
+
+```bash
+wp plugin deactivate --all          # or rename the folder over SFTP
+mv wp-content/plugins/suspect ~/disabled/suspect
+```
+
+## Diagnosis
+
+| Situation | Best path |
+| --- | --- |
+| Recovery email received, link valid | use the link, deactivate the offending plugin in the dashboard |
+| Email received but link expired | reset by isolating via filesystem, then fix email |
+| No email at all (SMTP broken) | filesystem isolation or wp-cli |
+| wp-admin loads but plugin screens fatal | use Recovery Mode to reach Plugins screen |
+| Fatal inside a mu-plugin or core file | filesystem editing is the only option |
+
+::: investigate
+Investigation mindset: Recovery Mode is a *convenience*, not a strategy. Any support workflow needs an access path that does not depend on email, because broken email is a common companion symptom.
+:::
+
+## Resolution
+
+1. **Enter Recovery Mode** and pause the broken plugin/theme from the dashboard.
+2. **Turn on logging** so the fatal is captured while you reproduce, then identify the specific file and line.
+3. **Fix the root cause**: update, roll back, or patch the plugin/child theme; if it is a snippet manager, disable that snippet before re-enabling the plugin.
+4. **Exit Recovery Mode** and verify the frontend, admin and REST endpoints.
+5. **Fix the recovery channel itself**: configure SMTP so future incidents can be handled without server access, and confirm `admin_email` reaches a monitored mailbox.
+
+## Verification
+
+- The site loads normally with the previously broken plugin either updated or replaced.
+- No new fatal in the log after replaying the original steps.
+- A test recovery email can be generated and received (send a WordPress test mail via an SMTP plugin).
+- The hosting account and SFTP path documented for the next incident.
+
+## Root Cause
+
+WordPress installs a last-resort admin path when plugin/theme code fatals. The mechanism depends on two things that can both be broken — the email transport and the admin address — which is why filesystem access remains the primary tool.
+
+## Prevention
+
+- Configure SMTP/transactional email so alerts and recovery mails are delivered ([/woocommerce/order-emails-not-sending](/woocommerce/order-emails-not-sending)).
+- Keep `admin_email` on a monitored, internal mailbox rather than a personal address.
+- Keep SSH/SFTP credentials in a shared, secure vault per site.
+- Keep a staged copy of every site so risky changes are testable without Recovery Mode.
+
+## Related Articles
+
+- [/errors/critical-error](/errors/critical-error)
+- [/errors/white-screen-of-death](/errors/white-screen-of-death)
+- [/plugins/plugin-fatal-error](/plugins/plugin-fatal-error)
+- [/hosting/ftp-sftp](/hosting/ftp-sftp)
+
+## Official References
+
+- [Recovery Mode](https://developer.wordpress.org/advanced-administration/security/recovery-mode/)
+- [Debugging in WordPress](https://developer.wordpress.org/advanced-administration/debug/debug-wordpress/)

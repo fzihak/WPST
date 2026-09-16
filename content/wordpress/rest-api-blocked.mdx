@@ -1,0 +1,132 @@
+---
+title: "REST API Blocked or Returning 401 / 403"
+description: "The REST API powers the editor, block themes and integrations. Diagnose auth failures, WAF blocks and plugin filters that break /wp-json."
+difficulty: Intermediate
+timeToFix: "20–60 min"
+appliesTo: [WordPress Core, Security, Hosting, WooCommerce]
+tags: [rest-api, security, hosting, plugin, api]
+severity: Medium
+updated: 2025-11-16
+---
+
+## Symptoms
+
+- `/wp-json/` returns 401, 403, 404 or an HTML page instead of JSON.
+- The block editor or Elementor fails with "The response is not a valid JSON response".
+- Mobile app or integration stops working: 401 despite correct credentials.
+- POST requests to the API fail only for logged-in users or only for unauthenticated ones.
+- Some routes work; specific namespaces 404 (e.g. `wc/v3`).
+
+## Possible Causes
+
+1. Authentication: invalid application password, expired OAuth token, or cookie nonce mismatch (common with cached pages or a host header mismatch).
+2. WAF/security plugins blocking `/wp-json/` or blocking POST/JSON payloads (very common after enabling bot protection).
+3. Plugin filters disabling REST: code returning a 401 for `rest_authentication_errors` or unregistering REST entirely.
+4. Permalinks broken, so `/wp-json/` cannot route ([permalinks article](/wordpress/permalinks-404)).
+5. Hosting rules: basic auth, hotlink protection, or a rule blocking the `Authorization` header.
+6. HTTPS/host mismatch: API called over one hostname, nonce issued for another.
+7. A plugin's own REST route registered after `rest_api_init` in an incorrect context, or a fatal in that route.
+
+## Prerequisites
+
+- The exact URL, method, headers and response body of the failing request.
+- An application password to test with (create a dedicated one per integration, never share admin credentials).
+- Access to logs and to security plugin/WAF rules.
+
+## Investigation
+
+1. **Test unauthenticated and authenticated calls.**
+
+```bash
+curl -sS -o /dev/null -w 'index=%{http_code}\n' https://example.com/wp-json/
+curl -sS https://example.com/wp-json/ | head -c 200
+curl -sS -u 'user:application password' https://example.com/wp-json/wp/v2/users/me -o /dev/null -w 'auth=%{http_code}\n'
+```
+
+2. **Read the error body** — WordPress returns a JSON error object with a code you can look up.
+
+```bash
+curl -sS https://example.com/wp-json/wp/v2/posts | head -c 400
+```
+
+3. **Check whether the request even reaches WordPress** (404/403 from the server versus JSON from WordPress).
+
+```bash
+curl -sS -D - -o /dev/null https://example.com/wp-json/ | grep -Ei '^server|^content-type|^x-'
+```
+
+4. **Check plugin filters and REST routes.**
+
+```bash
+wp plugin list --status=active --fields=name,status
+grep -rn 'rest_authentication_errors' wp-content/plugins wp-content/mu-plugins 2>/dev/null | head
+wp eval 'foreach (rest_get_server()->get_namespaces() as $ns) echo $ns."\n";' | head -20
+```
+
+5. **Verify the Authorization header survives** the server/proxy — a classic hosting issue.
+
+```bash
+curl -sS -u 'user:pass' -D - -o /dev/null https://example.com/wp-json/wp/v2/users/me | grep -i authorization
+```
+
+6. **Check for caching of API responses** and cookie/nonce mismatch.
+
+```bash
+curl -sS -o /dev/null -D - https://example.com/wp-json/wp/v2/posts | grep -iE 'cache-control|x-cache|set-cookie'
+```
+
+## Diagnosis
+
+| Observation | Cause | Fix |
+| --- | --- | --- |
+| HTML page instead of JSON | rewrite/host mapping | fix permalinks, verify host |
+| 401 with valid credentials | auth or header stripped | fix Authorization passing, nonce host |
+| 403 with no PHP log entry | WAF/security rule | whitelist `/wp-json/` for legitimate clients |
+| JSON error `rest_cookie_invalid_nonce` | cached page/nonce lifetime | purge, exclude API from cache |
+| Namespace missing from the list | plugin not loaded / fatal | check plugin status and log |
+| Works logged out, fails logged in | cookie auth + cache | bypass cache for authenticated requests |
+| Only POST fails | body blocked by WAF | inspect payload rules |
+
+::: investigate
+Investigation mindset: the REST API is just HTTP. Answer three questions — does the request reach WordPress, is it authenticated correctly, and does WordPress produce the JSON? Each has one command.
+:::
+
+## Resolution
+
+1. **Fix authentication first**: create a dedicated application password per integration, over HTTPS, and verify the nonce/domain matches the site's canonical URL.
+2. **Whitelist the API in security layers**: exclude `/wp-json/` and `?rest_route=` from bot challenges and body inspection for legitimate clients, keeping rate limits reasonable.
+3. **Restore routing**: flush permalinks, confirm rewrite rules, and check that `/wp-json/` is not redirected (redirects break POST requests silently).
+4. **Remove blocking plugin filters** (or scope them to specific routes), and update plugins that fatal inside their own REST route.
+5. **Fix host configuration** where `Authorization` is stripped: correct vhost/FastCGI settings so the header reaches PHP.
+6. **Decide a policy for anonymous access**: some sites legitimately restrict REST to authenticated users — document it so integrations are built accordingly, and never restrict the block editor.
+
+## Verification
+
+- `/wp-json/` returns JSON with a 200 from outside the network.
+- Authenticated requests via application password return expected data.
+- Block editor loads and saves; a store's `wc/v3` routes respond to a known key.
+- No 4xx/5xx for `/wp-json/` in a day of access logs for legitimate clients.
+
+## Root Cause
+
+REST failures come from routing, authentication or edge filtering. Because the API is also the editor's engine, blocking it "for security" breaks admin functionality — which is why policy and exceptions must be explicit.
+
+## Prevention
+
+- Include `/wp-json/` in WAF exception lists during provisioning.
+- Keep application passwords per integration and rotate them with the credentials calendar.
+- Monitor API error rates for integrations (they are silent failures otherwise).
+- Add a REST smoke test to release verification (fetch `/wp-json/` and one authenticated endpoint).
+
+## Related Articles
+
+- [/wordpress/permalinks-404](/wordpress/permalinks-404)
+- [/errors/403-forbidden](/errors/403-forbidden)
+- [/security/brute-force](/security/brute-force)
+- [/performance/caching-not-working](/performance/caching-not-working)
+
+## Official References
+
+- [WordPress: REST API handbook](https://developer.wordpress.org/rest-api/)
+- [WordPress: Application passwords](https://developer.wordpress.org/rest-api/using-the-rest-api/authentication/)
+- [Apache: forwarding the Authorization header](https://httpd.apache.org/docs/2.4/mod/mod_authz_core.html)

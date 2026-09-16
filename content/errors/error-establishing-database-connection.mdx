@@ -1,0 +1,144 @@
+---
+title: "Error Establishing a Database Connection"
+description: "Credentials, service, connections or corruption — the four mechanisms behind WordPress' most misleading error, with the commands that separate them."
+difficulty: Intermediate
+timeToFix: "15–90 min"
+appliesTo: [MySQL, WordPress Core, Hosting]
+tags: [mysql, database, hosting, fatal-error]
+severity: Critical
+updated: 2026-01-14
+featured: true
+---
+
+## Symptoms
+
+- Visitors see "Error establishing a database connection" (or a slightly different sentence from a plugin).
+- wp-admin may be unreachable entirely, or you can log in but every query fails.
+- Often appears with an accompanying 500 from a different layer, or the site loads only from a full-page cache.
+- A related variant prints `WordPress database error` lines and still renders a degraded page.
+
+## Possible Causes
+
+1. Wrong credentials or hostname in `wp-config.php` (typo, quotes, `localhost` vs socket path, changed user).
+2. MySQL/MariaDB service down, restarting, or unreachable over the network.
+3. Disk full or inode exhaustion — MySQL stops accepting writes first.
+4. `max_connections` reached: MySQL is up but refuses new connections.
+5. Corrupted tables or a crashed `wp_options` table.
+6. Database user's privileges removed, or the account suspended by the host.
+7. Changed table prefix after a migration with `DB_PREFIX` mismatch.
+8. A plugin running a runaway query that holds locks and eventually starves the pool.
+9. Object cache drop-in failing and surfacing as a DB error (usually Redis, not MySQL).
+
+## Prerequisites
+
+- Panel access with phpMyAdmin, or SSH with the MySQL client.
+- `wp-config.php` readable (do not edit blind — read the credentials first).
+- A backup before any repair, always.
+
+## Investigation
+
+1. **Read the credentials you actually have configured.**
+
+```bash
+wp config get DB_HOST --path=/home/user/public_html
+wp config get DB_NAME
+wp config get DB_USER
+# never echo the password into a ticket or shell history
+```
+
+2. **Test the database service and the credentials independently of WordPress.**
+
+```bash
+mysql -h DB_HOST -u DB_USER -p -e "SELECT 1"
+mysqladmin -h DB_HOST -u DB_USER -p status
+systemctl status mysql    # or: service mariadb status, on a VPS
+```
+
+3. **Check capacity before anything else on shared hosting.**
+
+```bash
+df -h
+df -i
+```
+
+4. **Look at the connection pressure.**
+
+```sql
+SHOW VARIABLES LIKE 'max_connections';
+SHOW STATUS LIKE 'Threads_connected';
+SHOW STATUS LIKE 'Max_used_connections';
+SHOW FULL PROCESSLIST;
+```
+
+5. **Test the schema WordPress needs.**
+
+```bash
+wp db check --path=/home/user/public_html
+wp db query "SELECT COUNT(*) FROM wp_options WHERE autoload='yes';"
+```
+
+6. **Confirm the file path/case of the credentials** and that `wp-config.php` has not been swapped by a deploy or a host security tool.
+
+::: investigate
+Investigation mindset: this error has exactly four mechanisms — **credentials, service availability, resource limits, data integrity**. Establish which one in this order; each step rules a mechanism out cheaply.
+:::
+
+## Diagnosis
+
+| Test results | Mechanism | Next step |
+| --- | --- | --- |
+| `mysql … SELECT 1` fails with *Access denied* | credentials/privileges | Fix user or password, or recreate the user |
+| Command hangs or *Connection refused* | service down / firewall | Restart MySQL, check port 3306 or the socket path |
+| Works by socket, fails via TCP `localhost` | host vs socket config | Use `localhost:/path/mysql.sock` or `127.0.0.1` |
+| Connects, then errors on queries | corruption | `wp db repair`, then check `CHECK TABLE` output |
+| `Too many connections` | pool exhausted | Kill long queries, raise limits, add object cache |
+| Only wp-admin fails | a plugin's admin query | Query Monitor / slow query log |
+
+## Resolution
+
+1. **Credentials:** check for surrounding whitespace inside quotes, correct the values, and confirm the DB user is assigned to that database with the host's panel.
+2. **Service:** restart MySQL/MariaDB; if it fails to start, inspect `/var/log/mysql/error.log` for disk or InnoDB errors.
+3. **Disk full:** free space (logs, backups, old caches), then verify MySQL starts cleanly and re-run `wp db check`.
+4. **Connections:** kill or schedule out the offending query, raise `max_connections` cautiously, and add a persistent object cache so options/transients stop hammering the DB.
+5. **Corruption:** snapshot the DB first, then repair.
+
+```bash
+wp db export pre-repair.sql
+wp db repair
+mysql -u user -p db -e "CHECK TABLE wp_options, wp_posts, wp_postmeta;"
+```
+
+6. **Suspension/privilege loss:** open a host ticket with the exact error string, timestamp and the SQL commands you ran; ask them to confirm the account and user state.
+
+## Verification
+
+- `wp db check` reports no corrupt tables.
+- The homepage, wp-admin and one REST request all return 200 as a logged-out user.
+- `Threads_connected` stays well under `max_connections` during a normal page load.
+- No new `Error establishing a database connection` in the log for 24 hours, including cron windows.
+
+## Root Cause
+
+WordPress surfaces a single message for four very different failures, which is why so many tickets stall: teams start with the database file instead of proving which of the four mechanisms is present.
+
+## Prevention
+
+- Monitor disk space and require a threshold alert at 85%.
+- Configure an object cache to cut query volume where traffic is high.
+- Keep DB credentials in one place and never sync `wp-config.php` blindly between environments.
+- Run `wp db check` in the quarterly maintenance checklist and before migrations.
+- Set up uptime monitoring that distinguishes a DB error page from a healthy 200 (check for the phrase in the response body).
+
+## Related Articles
+
+- [/mysql/database-repair](/mysql/database-repair)
+- [/mysql/search-replace](/mysql/search-replace)
+- [/runbooks/site-down](/runbooks/site-down)
+- [/performance/object-cache](/performance/object-cache)
+- [/hosting/cpanel](/hosting/cpanel)
+
+## Official References
+
+- [WordPress: Editing wp-config.php](https://developer.wordpress.org/advanced-administration/wordpress/wp-config/)
+- [MySQL: Server and status variables](https://dev.mysql.com/doc/refman/8.0/en/server-status-variables.html)
+- [MySQL: CHECK TABLE](https://dev.mysql.com/doc/refman/8.0/en/check-table.html)

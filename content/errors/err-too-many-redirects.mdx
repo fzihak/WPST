@@ -1,0 +1,142 @@
+---
+title: "ERR_TOO_MANY_REDIRECTS"
+description: "Redirect loops come from a URL or SSL mismatch, not from a broken link. Learn the three-command test that separates siteurl, HTTPS and CDN causes."
+difficulty: Intermediate
+timeToFix: "10–30 min"
+appliesTo: [WordPress Core, Hosting, CDN, DNS]
+tags: [redirect, dns, ssl, cloudflare, hosting]
+severity: High
+updated: 2026-01-15
+featured: true
+---
+
+## Symptoms
+
+- Chrome: `ERR_TOO_MANY_REDIRECTS`. Safari: "too many redirects". Firefox: "The page isn't redirecting properly".
+- Often starts after: installing an SSL certificate, moving to a new host, enabling Cloudflare, or setting "force HTTPS" in the panel.
+- `/wp-admin` may work while the frontend loops, or vice versa.
+- Sometimes only `www` loops and the bare domain is fine (or the reverse).
+
+## Possible Causes
+
+1. `siteurl` / `home` mismatch (`http` vs `https`, `www` vs non-`www`).
+2. CDN SSL mode set to **Flexible** while the origin already redirects to HTTPS → infinite loop.
+3. A redirect plugin, plus a hosting-level HTTPS rule, plus a CDN rule — three layers each adding a 301.
+4. `.htaccess` with a duplicate HTTPS redirect, or a canonical rule pointing at itself.
+5. WordPress Address and Site Address pointing to different hostnames with trailing-slash differences.
+6. A reverse proxy not forwarding `X-Forwarded-Proto`, so WordPress believes the request is insecure and redirects forever.
+7. Wrong A/CNAME record plus a "keep origin warm" style rule looping back.
+
+## Prerequisites
+
+- The exact redirect chain — never diagnose this from a screenshot.
+- Database access (to read/fix `siteurl` and `home`) or wp-cli.
+- Panel/CDN access to inspect SSL mode and redirect rules.
+
+## Investigation
+
+1. **Capture the chain.**
+
+```bash
+curl -sSIL https://example.com/ | grep -Ei '^(HTTP/|location|server|cf-ray)'
+curl -sSIL http://www.example.com/ | grep -Ei '^(HTTP/|location)'
+```
+
+Read it top-down: the *Location* values show exactly which layer keeps re-appending.
+
+2. **Compare the configured URLs** — this is the cause more often than everything else combined.
+
+```bash
+wp option get siteurl
+wp option get home
+wp option get blog_public
+```
+
+3. **Test the origin directly**, bypassing the CDN, to see whether the loop is at the edge or in WordPress.
+
+```bash
+dig +short example.com A
+curl -sSIL --resolve example.com:443:ORIGIN_IP https://example.com/ | head -12
+```
+
+4. **Check the HTTPS headers** WordPress sees. If `X-Forwarded-Proto` is missing behind a proxy, WordPress thinks you are on HTTP.
+
+```bash
+curl -sS https://example.com/wp-json/ -D - -o /dev/null | grep -i 'x-forwarded\|strict-transport'
+```
+
+5. **Inspect the layers that can redirect**:
+
+| Layer | Where to look | Typical mistake |
+| --- | --- | --- |
+| WordPress | `siteurl`/`home`, redirect plugins | http↔https mixed values |
+| Server | `.htaccess`, vhost, NGINX `return 301` | duplicate HTTPS rules |
+| Panel | "Force HTTPS", www canonicalization | doubling with plugin rules |
+| CDN | SSL mode, Page Rules, Bulk Redirects | Flexible SSL behind an HTTPS origin |
+
+::: investigate
+Investigation mindset: count the redirect layers. A loop needs at least two rules that disagree about the final canonical URL. Find the disagreement, not a rule.
+:::
+
+## Diagnosis
+
+| Pattern in the chain | Cause |
+| --- | --- |
+| `https → http → https …` | Mixed `siteurl`/`home` or Flexible SSL |
+| `www → non-www → www …` | Competing canonicalization rules |
+| Loop stops at origin test but present publicly | CDN/proxy config |
+| `wp-login.php` loops, frontend fine | `FORCE_SSL_ADMIN` vs insecure detection |
+| Chain includes `?redirect_to=` | Security plugin redirect loop after login |
+
+## Resolution
+
+1. **Normalise the URLs** in the database (backup first). Use `--precise` so serialized data is not corrupted.
+
+```bash
+wp option update siteurl 'https://example.com'
+wp option update home 'https://example.com'
+wp search-replace 'http://example.com' 'https://example.com' --all-tables --precise --dry-run
+wp cache flush
+```
+
+2. **Choose exactly one canonical form** (HTTPS + the form you actually serve, usually `https://example.com`) and enforce it in one place.
+3. **Fix the CDN SSL mode** to Full (strict) with a valid origin certificate, then purge.
+4. **Deduplicate server rules**: keep the WordPress block intact, remove hand-written HTTPS redirects when the panel or CDN already does it.
+5. If a reverse proxy is involved, forward the scheme:
+
+```nginx
+proxy_set_header X-Forwarded-Proto $scheme;
+proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+```
+6. **Verify from a truly clean client** — a browser can cache a 301 for a long time; test with curl and a private window.
+
+## Verification
+
+- `curl -sSIL` shows at most one or two 301s and then `200`.
+- Login works over HTTPS on both `www` and the apex (or the non-canonical host redirects once, cleanly).
+- No loop on `/wp-admin`, `/cart`, and one deep post URL.
+- `wp option get siteurl` equals `wp option get home`.
+
+## Root Cause
+
+A redirect loop is a disagreement about the canonical URL. Every layer adds a rule; the loop exists because at least two rules disagree, each undoing the previous request's decision.
+
+## Prevention
+
+- Document the canonical URL and where it is enforced (one layer only).
+- Before enabling a CDN or changing hosts, list every redirect: plugin, `.htaccess`, panel, CDN.
+- Include redirect-chain checks in the migration checklist ([/checklists/migration](/checklists/migration)).
+- Keep `siteurl`/`home` in a deploy checklist so config syncs cannot desync them.
+
+## Related Articles
+
+- [/errors/ssl-handshake-failed](/errors/ssl-handshake-failed)
+- [/hosting/dns-not-propagating](/hosting/dns-not-propagating)
+- [/security/file-permissions](/security/file-permissions)
+- [/migration/migrate-wordpress-site](/migration/migrate-wordpress-site)
+
+## Official References
+
+- [WordPress: Changing the site URL](https://developer.wordpress.org/advanced-administration/upgrade/migrating/)
+- [Cloudflare: SSL/TLS modes](https://developers.cloudflare.com/ssl/origin-configuration/ssl-modes/)
+- [WP-CLI: search-replace](https://developer.wordpress.org/cli/commands/search-replace/)

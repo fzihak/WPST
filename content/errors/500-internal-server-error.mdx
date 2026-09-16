@@ -1,0 +1,136 @@
+---
+title: "500 Internal Server Error"
+description: "The catch-all server error: how to find the real fatal in the logs, isolate the layer, and fix the cause instead of restarting PHP-FPM until it happens again."
+difficulty: Intermediate
+timeToFix: "15–60 min"
+appliesTo: [WordPress Core, Plugins, Themes, Hosting, PHP]
+tags: [fatal-error, php, logs, hosting, debug]
+severity: Critical
+updated: 2026-01-18
+featured: true
+---
+
+## Symptoms
+
+- Browser shows "500 Internal Server Error", "HTTP ERROR 500", or the host's generic error page.
+- The page may work for logged-in admins but fail for visitors (or the reverse) — that difference is a clue, not noise.
+- `curl -sI https://site.com/` returns `HTTP/2 500` with an empty or very small body.
+- wp-admin may still load, only the front end fails — usually a theme or plugin frontend hook.
+
+## Possible Causes
+
+1. A PHP fatal error in a plugin, theme or snippet (most common by far).
+2. Exhausted PHP memory or a timeout on a heavy request.
+3. A broken `.htaccess` or a server directive not allowed in that context.
+4. File permissions or ownership wrong after a manual upload or a restore.
+5. A corrupted or partly-written file after an interrupted update.
+6. Corrupted rows in `wp_options` or a database connection problem surfacing as 500.
+7. Malware/injected code rewriting plugin files.
+
+## Prerequisites
+
+- Access to the site's error log (panel log viewer, SFTP, or SSH).
+- A full backup of files and database taken before any change.
+- Staging preferred. If you must work on production, log every change you make.
+
+## Investigation
+
+1. **Confirm exactly which requests fail.** Homepage, a deep post URL, `/wp-login.php`, `/wp-json/`.
+2. **Read the log, not the browser.** The 500 is only a symptom; the PHP fatal has the file and line.
+
+```bash
+curl -sS -o /dev/null -w '%{http_code} %{time_total}s\n' https://example.com/?nocache=1
+curl -sI https://example.com/wp-login.php | head -5
+tail -n 150 ~/logs/php_error.log        # or public_html/error_log, or wp-content/debug.log
+grep -i 'PHP Fatal' error_log | tail -20
+```
+
+3. **Turn on structured logging if there is no usable log** (staging, or a log path outside the webroot).
+
+```php
+// wp-config.php — remove again when the ticket closes
+define( 'WP_DEBUG', true );
+define( 'WP_DEBUG_LOG', dirname( ABSPATH ) . '/logs/wp-debug.log' );
+define( 'WP_DEBUG_DISPLAY', false );
+```
+
+4. **Classify the fatal.** Read the first fatal, not the last: the first one usually causes the cascade.
+
+| Log signature | Layer | Next test |
+| --- | --- | --- |
+| `PHP Fatal error: Uncaught Error: Call to undefined function` | Plugin/theme or PHP version mismatch | Update or roll back the named plugin |
+| `Allowed memory size of … bytes exhausted` | PHP limit or a loop | Raise memory, then find the call site |
+| `Cannot redeclare function` | Duplicate plugin or snippet manager | Deactivate one of the two providers |
+| `[suexec] uid mismatch` / `SoftException` | File ownership | Fix ownership, not chmod 777 |
+| `.htaccess: Invalid command` | Server config | Rename `.htaccess`, rebuild the WP block |
+
+::: investigate
+Investigation mindset: a 500 is a *symptom category*, not a diagnosis. Your job in the first ten minutes is to answer one question — **which layer produced the failure?**
+:::
+
+5. **Isolate the WordPress layer** when the hosting layer is healthy and the log points into `wp-content/`.
+
+```bash
+wp plugin list --status=active
+wp plugin deactivate --all
+# then re-enable half at a time; on FTP instead: rename the plugins folder
+```
+
+6. **Switch to a default theme** (`wp theme activate twentytwentyfour`) to rule out `functions.php`.
+7. **Try Recovery Mode** if wp-admin is also 500: WordPress e-mails the admin a recovery link for plugins/themes that fatal.
+8. **Check the filesystem**: recent manual edits, half-uploaded files, mixed ownership.
+
+```bash
+find . -name '*.php' -newermt '2 days ago' | head -20
+find . -type f -perm -o+w | head          # world-writable = red flag
+```
+
+## Diagnosis
+
+- **Fatal in a plugin file, only on one request type** → plugin code path triggered by that request.
+- **500 only on pages that render a shortcode/block** → the block's callback is fatal.
+- **500 immediately after a PHP version switch** → deprecated/removed functions.
+- **500 on every request including `/wp-login.php`** → core, `.htaccess`, memory limit or DB.
+- **500 with no log entry at all** → check the *hosting* error log; the process may be killed before PHP can log.
+
+## Resolution
+
+1. If a plugin is the cause: update it, or roll back to the previous version, and file a reproducible report with the stack trace.
+2. If memory is the cause: raise `memory_limit` to 512M temporarily (see [/php/memory-limit](/php/memory-limit)) and then reduce the workload.
+3. If `.htaccess` is the cause: restore the WordPress block only, outside the `# BEGIN/END WordPress` markers.
+4. If ownership/permissions are the cause: files `644`, directories `755`, `wp-config.php` `600`, owner = hosting account user.
+5. If a file is corrupt from a partial update: replace it from a clean copy of the same version, then re-run the update.
+6. If malware is suspected: do not patch in place — see [/security/malware-cleanup](/security/malware-cleanup) and restore from a pre-compromise backup.
+
+## Verification
+
+- All previously failing URLs return `200` with a full body.
+- No new `PHP Fatal` lines after reproducing the original request twice.
+- Test as a logged-out user in a private window, and with page cache purged.
+- `wp db check` returns OK, `wp plugin status` shows no deactivated-with-error plugins.
+
+## Root Cause
+
+A 500 means a *request-scoped* failure: PHP aborted the response. The article's work is to convert that into one of five mechanisms — fatal, limit, config, filesystem, or data.
+
+## Prevention
+
+- Never edit production without a backup and a staging copy.
+- Enable error logging with rotation; alert on new fatal patterns.
+- Pin a supported PHP version and test plugins on staging before updating production.
+- Use `WP_DEBUG_LOG` on staging permanently, `WP_DEBUG_DISPLAY` never.
+- Keep an uptime check on `/wp-login.php` — it fails before the homepage in many incident types.
+
+## Related Articles
+
+- [/errors/white-screen-of-death](/errors/white-screen-of-death)
+- [/errors/allowed-memory-size-exhausted](/errors/allowed-memory-size-exhausted)
+- [/plugins/plugin-fatal-error](/plugins/plugin-fatal-error)
+- [/apache/htaccess](/apache/htaccess)
+- [/runbooks/site-down](/runbooks/site-down)
+
+## Official References
+
+- [Debugging in WordPress](https://developer.wordpress.org/advanced-administration/debug/debug-wordpress/)
+- [Recovery Mode](https://developer.wordpress.org/advanced-administration/security/recovery-mode/)
+- [Apache .htaccess how-to](https://httpd.apache.org/docs/2.4/howto/htaccess.html)
