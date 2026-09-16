@@ -4,39 +4,39 @@
   --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 
-  /* ── WordPress-native palette ────────────────────────────────── */
+  /* ── Modern WordPress 6.x palette ───────────────────────────── */
   --color-wp-blue: #2271b1;
   --color-wp-blue-dark: #135e96;
   --color-wp-blue-darker: #0a4b78;
   --color-wp-blue-light: #72aee6;
-  --color-wp-blue-wash: #e7f2f9;
-  --color-wp-blue-pale: #f0f6fc;
+  --color-wp-blue-wash: #f0f6fc;
+  --color-wp-blue-pale: #f8fafc;
 
   --color-wp-dark: #1d2327;
   --color-wp-dark-mid: #2c3338;
   --color-wp-dark-soft: #3c434a;
 
-  --color-wp-body: #f0f0f1;
+  --color-wp-body: #f8fafc;
   --color-wp-white: #ffffff;
 
-  --color-wp-text: #1e1e1e;
-  --color-wp-text-secondary: #50575e;
-  --color-wp-text-muted: #787c82;
-  --color-wp-text-light: #a7aaad;
+  --color-wp-text: #0f172a;
+  --color-wp-text-secondary: #475569;
+  --color-wp-text-muted: #64748b;
+  --color-wp-text-light: #94a3b8;
 
-  --color-wp-border: #c3c4c7;
-  --color-wp-border-light: #dcdcde;
+  --color-wp-border: #e2e8f0;
+  --color-wp-border-light: #f1f5f9;
   --color-wp-border-focus: #2271b1;
 
   --color-wp-success: #00a32a;
-  --color-wp-success-light: #edfaef;
-  --color-wp-warning: #dba617;
-  --color-wp-warning-light: #fcf9e8;
-  --color-wp-error: #d63638;
-  --color-wp-error-light: #fcf0f1;
+  --color-wp-success-light: #f0fdf4;
+  --color-wp-warning: #d97706;
+  --color-wp-warning-light: #fffbeb;
+  --color-wp-error: #dc2626;
+  --color-wp-error-light: #fef2f2;
 
-  --shadow-card: 0 1px 3px rgba(0, 0, 0, 0.04), 0 0 0 1px rgba(0, 0, 0, 0.02);
-  --shadow-lift: 0 12px 32px -8px rgba(34, 113, 177, 0.18), 0 0 0 1px rgba(34, 113, 177, 0.12);
+  --shadow-card: 0 1px 3px 0 rgba(0, 0, 0, 0.05), 0 1px 2px -1px rgba(0, 0, 0, 0.05);
+  --shadow-lift: 0 12px 24px -4px rgba(15, 23, 42, 0.08), 0 4px 8px -2px rgba(15, 23, 42, 0.04);
 }
 
 @layer base {
@@ -108,36 +108,37 @@
       radial-gradient(500px 260px at 90% 10%, rgba(19, 94, 150, 0.08), transparent 60%);
   }
   .card {
-    border-radius: 12px;
-    border: 1px solid var(--color-wp-border-light);
+    border-radius: 16px;
+    border: 1px solid var(--color-wp-border);
     background-color: var(--color-wp-white);
     box-shadow: var(--shadow-card);
   }
   .card-hover {
-    transition: transform 0.3s ease-out, box-shadow 0.3s ease-out, border-color 0.3s ease-out;
+    transition: transform 0.25s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.25s cubic-bezier(0.16, 1, 0.3, 1), border-color 0.2s ease;
   }
   .card-hover:hover {
     transform: translateY(-2px);
     box-shadow: var(--shadow-lift);
-    border-color: rgba(34, 113, 177, 0.3);
+    border-color: rgba(34, 113, 177, 0.4);
   }
   .eyebrow {
     font-family: var(--font-mono);
     font-size: 10.5px;
-    font-weight: 500;
+    font-weight: 600;
     text-transform: uppercase;
-    letter-spacing: 0.2em;
+    letter-spacing: 0.18em;
     color: var(--color-wp-blue);
   }
   .btn-primary {
-    @apply inline-flex items-center justify-center gap-2 rounded-lg px-4 py-2.5 text-[13.5px] font-semibold text-white transition;
+    @apply inline-flex items-center justify-center gap-2 rounded-xl px-4 py-2.5 text-[13.5px] font-semibold text-white transition-all shadow-xs;
     background-color: var(--color-wp-blue);
   }
   .btn-primary:hover {
     background-color: var(--color-wp-blue-dark);
+    box-shadow: 0 4px 12px rgba(34, 113, 177, 0.25);
   }
   .btn-secondary {
-    @apply inline-flex items-center justify-center gap-2 rounded-lg px-4 py-2.5 text-[13.5px] font-semibold transition;
+    @apply inline-flex items-center justify-center gap-2 rounded-xl px-4 py-2.5 text-[13.5px] font-semibold transition-all;
     border: 1px solid var(--color-wp-border);
     background-color: var(--color-wp-white);
     color: var(--color-wp-text);
@@ -145,15 +146,16 @@
   .btn-secondary:hover {
     border-color: var(--color-wp-blue);
     color: var(--color-wp-blue);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.04);
   }
   .btn-ghost {
-    @apply inline-flex items-center gap-1.5 rounded-md px-2.5 py-1.5 font-mono text-[11px] transition;
-    border: 1px solid var(--color-wp-border-light);
+    @apply inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 font-mono text-[11px] transition;
+    border: 1px solid var(--color-wp-border);
     color: var(--color-wp-text-secondary);
     background-color: var(--color-wp-white);
   }
   .btn-ghost:hover {
-    border-color: rgba(34, 113, 177, 0.3);
+    border-color: var(--color-wp-blue);
     color: var(--color-wp-blue);
   }
   .field {
