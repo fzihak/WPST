@@ -1,10 +1,9 @@
 import { useEffect, useState } from "react";
-import { ChevronDown, Command, Menu, Search, X, ArrowUpRight } from "lucide-react";
+import { ChevronDown, Command, Menu, Search, X } from "lucide-react";
 import { Link, useRoute, useScrollReset, navigate } from "@/lib/router";
 import { SearchPalette } from "@/components/SearchPalette";
 import { Icon } from "@/components/Icon";
 import { SECTIONS } from "@/data/taxonomy";
-import { stats } from "@/lib/content";
 import { cn } from "@/utils/cn";
 import logoImg from "@/assets/logo_wpst.png";
 
@@ -75,19 +74,6 @@ export function Layout({ children }: { children: React.ReactNode }) {
         Skip to content
       </a>
 
-      {/* ── Top announcement bar (WP dark) ─────────────────────────── */}
-      <div style={{ backgroundColor: "var(--color-wp-dark)", borderBottom: "1px solid var(--color-wp-dark-mid)" }} className="text-white/70">
-        <div className="mx-auto flex max-w-7xl items-center justify-between gap-3 px-4 py-1.5 font-mono text-[11px] sm:px-6">
-          <p className="flex min-w-0 items-center gap-2 truncate">
-            <span className="inline-block h-1.5 w-1.5 shrink-0 rounded-full bg-green-400 shadow-[0_0_8px_rgba(74,222,128,.6)]" />
-            <span className="truncate">open source · MIT · {stats.articles} articles · Markdown/MDX content</span>
-          </p>
-          <Link to="/contribute" className="hidden shrink-0 items-center gap-1 text-white/70 hover:text-white sm:inline-flex">
-            contribute a fix <ArrowUpRight className="h-3 w-3" />
-          </Link>
-        </div>
-      </div>
-
       {/* ── Main header (WP dark sidebar color) ────────────────────── */}
       <header
         className="sticky top-0 z-80 backdrop-blur-xl"
@@ -96,21 +82,16 @@ export function Layout({ children }: { children: React.ReactNode }) {
           borderBottom: "1px solid var(--color-wp-dark-mid)",
         }}
       >
-        <div className="mx-auto flex h-14 max-w-7xl items-center gap-3 px-4 sm:px-6">
-          <Link to="/" className="group flex shrink-0 items-center gap-2.5">
+        <div className="mx-auto flex h-16 max-w-7xl items-center gap-4 px-4 sm:px-6">
+          <Link to="/" className="group flex shrink-0 items-center gap-3">
             <img
               src={logoImg}
               alt="WordPress Support Toolkit"
-              className="h-9 w-9 rounded-lg object-contain drop-shadow-sm transition-transform duration-200 group-hover:scale-105"
-              style={{ background: "white", padding: "2px", borderRadius: "8px" }}
+              className="h-9 w-9 rounded-full bg-white p-1 shadow-sm ring-1 ring-white/20 transition-transform duration-200 group-hover:scale-105"
             />
-            <span className="leading-tight">
-              <span className="block text-[15px] font-bold tracking-tight text-white">
-                WP Support Toolkit
-              </span>
-              <span className="hidden font-mono text-[10px] uppercase tracking-[0.18em] text-white/50 sm:block">
-                WPST · troubleshooting
-              </span>
+            <span className="text-[15.5px] font-bold tracking-tight text-white transition-colors group-hover:text-[#72aee6]">
+              <span className="hidden sm:inline">WordPress Support Toolkit</span>
+              <span className="sm:hidden">WPST</span>
             </span>
           </Link>
 
@@ -215,7 +196,7 @@ export function Layout({ children }: { children: React.ReactNode }) {
               aria-label="Search"
             >
               <Search className="h-3.5 w-3.5" />
-              <span className="hidden md:inline">Search the lab</span>
+              <span className="hidden md:inline">Search docs...</span>
               <kbd className="hidden items-center gap-0.5 rounded border border-white/20 px-1.5 py-0.5 font-mono text-[10px] md:inline-flex">
                 <Command className="h-2.5 w-2.5" />K
               </kbd>
@@ -237,9 +218,9 @@ export function Layout({ children }: { children: React.ReactNode }) {
             style={{ backgroundColor: "var(--color-wp-dark)", borderColor: "var(--color-wp-dark-mid)" }}
           >
             {/* Mobile logo */}
-            <div className="mb-4 flex items-center gap-2.5 border-b border-white/10 pb-4">
-              <img src={logoImg} alt="WordPress Support Toolkit" className="h-8 w-8 rounded-md object-contain" style={{ background: "white", padding: "2px" }} />
-              <span className="text-[14px] font-bold text-white">WP Support Toolkit</span>
+            <div className="mb-4 flex items-center gap-3 border-b border-white/10 pb-4">
+              <img src={logoImg} alt="WordPress Support Toolkit" className="h-8 w-8 rounded-full bg-white p-1 shadow-sm ring-1 ring-white/20" />
+              <span className="text-[14.5px] font-bold text-white">WordPress Support Toolkit</span>
             </div>
             <div className="grid grid-cols-2 gap-2">
               {[...PRIMARY_NAV, ...MORE_NAV].map((m) => (
@@ -279,14 +260,13 @@ export function Layout({ children }: { children: React.ReactNode }) {
         <div className="mx-auto max-w-7xl px-4 py-12 sm:px-6">
           <div className="grid gap-10 sm:grid-cols-2 lg:grid-cols-4">
             <div>
-              <div className="flex items-center gap-2.5">
+              <div className="flex items-center gap-3">
                 <img
                   src={logoImg}
                   alt="WordPress Support Toolkit"
-                  className="h-8 w-8 rounded-md object-contain drop-shadow-sm"
-                  style={{ background: "white", padding: "2px" }}
+                  className="h-8 w-8 rounded-full bg-white p-1 shadow-sm ring-1 ring-white/20"
                 />
-                <span className="text-[15px] font-bold text-white">WP Support Toolkit</span>
+                <span className="text-[15px] font-bold text-white">WordPress Support Toolkit</span>
               </div>
               <p className="mt-3 max-w-xs text-[13px] leading-6 text-white/50">
                 The open knowledge base for WordPress troubleshooting. Investigation-first articles, runbooks and
