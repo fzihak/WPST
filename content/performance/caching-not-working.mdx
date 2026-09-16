@@ -1,0 +1,124 @@
+---
+title: "Caching Plugin Not Caching (or Caching Too Much)"
+description: "Diagnose cache miss ratios, wrong pages being cached, purge failures and logged-in caching: what each setting actually does and how to verify with headers."
+difficulty: Advanced
+timeToFix: "30–120 min"
+appliesTo: [Performance, Caching, CDN, WooCommerce]
+tags: [performance, cache, cloudflare, woocommerce, ttfb]
+severity: Medium
+updated: 2025-11-18
+---
+
+## Symptoms
+
+- Page cache is enabled, but TTFB is unchanged and headers show no cache hit.
+- Cache hit ratio oscillates; purging does not fix stale content.
+- Logged-in users see cached pages (or admins get logged out), cart and checkout behave strangely.
+- Content updates take 30+ minutes to appear even after manual purge.
+- Cache works on the homepage but not on category/product pages.
+
+## Possible Causes
+
+1. Cache bypass conditions too broad: cookies from analytics, plugins or consent tools set a cookie that excludes the visitor.
+2. Cache-Control headers from another layer (application, CDN, or a header-setting plugin) conflict with the plugin's.
+3. Pages excluded intentionally that then look like "not caching" (cart, checkout, my-account, admin).
+4. Cache key variance: query strings, device groups, currency/country variants → each combination stored separately.
+5. Object cache missing, so even a page-cache hit requires database work for menus and options.
+6. Purge propagation failing between plugin and CDN (API key, zone ID, or a hostname mismatch).
+7. Logged-in caching enabled without a correct private/`no-cache` handling for session pages.
+
+## Prerequisites
+
+- Access to the cache plugin settings and the CDN dashboard.
+- A monitoring tool or a repeatable curl loop to measure hit ratio before/after.
+- Staging (or a low-traffic window) to test bypass rules.
+
+## Investigation
+
+1. **Measure, before changing anything.**
+
+```bash
+for i in 1 2 3; do curl -sS -o /dev/null -D - "https://example.com/" | grep -iE 'cache-control|x-cache|cf-cache-status|age|vary'; done
+curl -sS -H 'Cookie: wordpress_logged_in=1' -o /dev/null -D - https://example.com/ | grep -iE 'cache-control|x-cache'
+```
+
+2. **Identify what varies the cache key.**
+
+```bash
+curl -sS -o /dev/null -D - https://example.com/?utm_source=test | grep -iE 'x-cache|age|vary'
+curl -sS -o /dev/null -D - -H 'Accept-Encoding: gzip' https://example.com/ | grep -iE 'vary|x-cache'
+```
+
+3. **Check bypass rules in the plugin** for cookie/URL patterns, and confirm they are not matching every visitor (a common one: bypass on *any* `wordpress_` or third-party cookie).
+
+4. **Verify purge propagation**: change a post title, purge from the plugin, and check the CDN header again.
+
+```bash
+curl -sSI https://example.com/blog/test-post/ | grep -iE 'age|cf-cache-status'
+```
+
+5. **Look for conflicting caching layers**: two page caches, or a CDN rule overriding origin headers.
+
+| Layer | Evidence | Risk |
+| --- | --- | --- |
+| Plugin page cache | files in `cache/`, plugin debug comments in HTML | excludes dynamic pages incorrectly |
+| Server cache (NGINX FastCGI/LiteSpeed) | `x-cache` headers, `hits/misses` stats | bypass rules differ from the plugin |
+| CDN | `cf-cache-status`, `age` | caches logged-in or cart responses |
+| Object cache | `wp cache type` | missing → no gain on admin/logged-in |
+
+## Diagnosis
+
+| Observation | Cause | Fix |
+| --- | --- | --- |
+| `cf-cache-status: DYNAMIC`, no plugin comment | request bypassing cache | fix bypass rules (cookies, query strings) |
+| Same page, different keys per visit | cookie/query variance | normalise keys, ignore marketing params |
+| News pages never cache | exclusion rule too broad | narrow exclusions |
+| Cached admin/cart pages | wrong exclusions | exclude dynamic paths, purge now |
+| Purge does not propagate | wrong zone/API credentials | fix credentials, verify with headers |
+| Content stale after purge | object cache holds stale options | flush object cache too |
+| High hit ratio but slow admin | object cache missing | add persistent object cache |
+
+::: investigate
+Investigation mindset: caching is an *observability* problem before it is a configuration problem. Document the expected headers for cached versus uncached pages; deviation becomes obvious in three commands.
+:::
+
+## Resolution
+
+1. **Normalise the cache key**: ignore `utm_*`, `fbclid` and similar parameters; keep currency/country variants only where business-critical.
+2. **Narrow bypass conditions**: exclude only sessions, carts, authenticated editors and specific paths — not "any cookie".
+3. **Fix purging end to end**: plugin → server cache → CDN → object cache; test each hop with a header check after a content change.
+4. **Handle logged-in users deliberately**: private caching or full bypass; never a shared cache for session pages.
+5. **Add a persistent object cache** so cache hits are actually cheap ([/performance/object-cache](/performance/object-cache)).
+6. **Document the exception list** (cart, checkout, my-account, previews, search results, LMS lesson pages) and review it whenever a new plugin appears.
+
+## Verification
+
+- Expected headers for cached pages: `cf-cache-status: HIT` and/or plugin cache markers, low `age`.
+- Dynamic pages (cart, checkout, account) always bypass: `Cache-Control: no-store, private`.
+- Content change → visible within one purge cycle (usually seconds) across all layers.
+- Anonymous TTFB improves measurably (document before/after), logged-in pages improve after object cache is added.
+- Hit ratio ≥ 90% for anonymous traffic over 24 hours.
+
+## Root Cause
+
+Caches fail in two directions: not caching (variance and bypass rules) and caching too much (missing exclusions). Both are configuration correctness problems that only show up in real traffic, so they must be verified with headers and measured after release.
+
+## Prevention
+
+- Treat cache configuration as part of the release process; include the header expectations in the checklist.
+- Keep one page-cache layer authoritative and document the others.
+- Monitor hit ratio, TTFB and error rates together.
+- Re-check exclusions after adding any plugin that sets cookies or handles sessions.
+
+## Related Articles
+
+- [/performance/ttfb](/performance/ttfb)
+- [/performance/object-cache](/performance/object-cache)
+- [/woocommerce/cart-session-lost](/woocommerce/cart-session-lost)
+- [/checklists/performance](/checklists/performance)
+
+## Official References
+
+- [WordPress: Caching overview](https://developer.wordpress.org/advanced-administration/performance/cache/)
+- [Cloudflare: `cf-cache-status`](https://developers.cloudflare.com/cache/concepts/cache-responses/)
+- [WooCommerce: Configuring caching plugins](https://woocommerce.com/document/configuring-caching-plugins/)

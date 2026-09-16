@@ -1,0 +1,128 @@
+---
+title: "FTP / SFTP Access Troubleshooting"
+description: "Cannot connect, cannot upload, or passive-mode timeouts: the connection matrix, firewall realities and why SFTP is not FTPS."
+difficulty: Beginner
+timeToFix: "10–45 min"
+appliesTo: [Hosting, FTP, SFTP, SSH]
+tags: [ftp, hosting, cpanel, permissions, logs]
+severity: Medium
+updated: 2025-11-24
+---
+
+## Symptoms
+
+- "Connection timed out" or "ECONNREFUSED" before any login prompt.
+- Login succeeds but the directory listing never loads (the classic passive-mode hang).
+- Upload fails at the end with "550 Permission denied" or "552 quota exceeded".
+- File names with unusual characters cause errors or silently missing files.
+- Works from one network but not another (office vs home vs VPN).
+
+## Possible Causes
+
+1. Wrong port or protocol confusion: FTP (21) vs FTPS (21+TLS) vs SFTP (22, SSH-based).
+2. Passive ports not open through the host or local firewall — the most common cause of post-login hangs.
+3. Credentials wrong, or the FTP account is scoped to a directory (making a correct path look "missing").
+4. Disk quota or inode limits reached, so uploads fail at the final write.
+5. Permissions/ownership of the target path rejecting the FTP user's write.
+6. Host firewall blocking your IP after failed login attempts (fail2ban style).
+7. Client configuration: TLS mode mismatch, ASCII transfers of binary files, or an outdated client.
+
+## Prerequisites
+
+- The correct protocol for the account: prefer SFTP (port 22) whenever available.
+- The FTP account's intended directory (the panel shows it) and the host's IP/ports.
+- A client you can configure precisely (FileZilla, Cyberduck, or the CLI).
+
+## Investigation
+
+1. **Test the port before blaming credentials.**
+
+```bash
+nc -vz ftp.example.com 21
+nc -vz ftp.example.com 22
+curl --ftp-ssl -v ftp://ftp.example.com/ 2>&1 | tail -15
+```
+
+2. **Read the exact server response** in verbose mode — it names the stage that fails.
+
+```bash
+sftp -v -P 22 user@example.com
+ssh -v user@example.com        # if SFTP/SSH is available, this is more informative
+```
+
+3. **Confirm the account scope and quota.**
+
+```text
+cPanel → FTP Accounts → shows the directory and quota
+cPanel → File Manager → the directory exists and is writable
+Metrics → Disk usage and inodes
+```
+
+4. **Reduce variables**: passive mode on, explicit TLS off (for diagnosis only), single connection, no multiplexing.
+5. **Check the server side for blocked IPs** if authentication succeeded once and now times out.
+
+```bash
+grep -i 'pure-ftpd\|proftpd\|vsftpd' /var/log/syslog | tail -20
+```
+
+## Diagnosis
+
+| Stage where it fails | Meaning | Fix |
+| --- | --- | --- |
+| Before the banner | port/firewall | open 21/22 or use another network |
+| Login prompt, then timeouts | passive ports blocked | enable passive mode; ask host for the passive range |
+| "530 Login incorrect" | credentials/account | reset password, verify the account username |
+| "550 Permission denied" | path/permissions | correct path and ownership |
+| "552 Quota exceeded" | disk/inode quota | free space, raise quota |
+| Listing OK, uploads hang | client TLS/ASCII mode | switch to SFTP, force binary mode |
+| Intermittent blocks | fail2ban/IP ban | ask host to unblock, fix repeated auth failures |
+
+::: investigate
+Investigation mindset: the connection is a sequence of stages. Note the last stage that *succeeded* and you have already narrowed the cause to a handful of possibilities — no guessing required.
+:::
+
+## Resolution
+
+1. **Prefer SFTP/SSH** for file work: encrypted, single port, and compatible with `rsync` for large trees.
+
+```bash
+sftp user@example.com
+rsync -avz --delete public_html/ user@example.com:public_html/
+```
+
+2. **Fix passive-mode configuration** if FTP is the only option: enable PASSIVE in the client, and confirm the host's passive port range (host documentation usually lists it).
+3. **Create a scoped FTP account** with a memorable path and the minimum necessary directory, then test the exact path with a single small file.
+4. **Resolve permission errors properly** ([permissions article](/security/file-permissions)): fix ownership to the account user rather than loosening modes.
+5. **Free quota** if disk/inodes are full; removing old backups and logs is usually enough.
+6. **Avoid FTP for code deploys**: get it into Git so deploys are versioned and reversible ([git workflow](/deployment/git-workflow)).
+
+## Verification
+
+- Connection succeeds from two different networks (local + one external).
+- A small file uploads and downloads byte-identical (`md5sum` comparison).
+- Deleting and re-uploading a directory works without permission errors.
+- The site renders after the file change, and no new 403/500 appears.
+
+## Root Cause
+
+File transfer failures come from one of four layers: network (ports/firewall), authentication (credentials/scope), storage (quota/permissions) or client (mode/TLS/protocol). The verbose output always names the layer.
+
+## Prevention
+
+- Document the protocol, host, port, directory and account per site in the runbook.
+- Use SFTP keys rather than passwords where possible; keep keys out of tickets.
+- Keep a "deployment" path that does not require FTP at all.
+- Track disk/inode usage alongside backups so quota surprises happen at low-risk times.
+
+## Related Articles
+
+- [/hosting/cpanel](/hosting/cpanel)
+- [/security/file-permissions](/security/file-permissions)
+- [/deployment/git-workflow](/deployment/git-workflow)
+- [/wordpress/recovery-mode](/wordpress/recovery-mode)
+
+## Official References
+
+- [cPanel: FTP accounts documentation](https://docs.cpanel.net/cpanel/files/ftp-accounts/)
+- [RFC 959: File Transfer Protocol](https://www.rfc-editor.org/rfc/rfc959)
+- [WordPress: Using SFTP/SSH](https://developer.wordpress.org/advanced-administration/server/)

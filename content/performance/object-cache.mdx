@@ -1,0 +1,138 @@
+---
+title: "Object Cache (Redis / Memcached) Done Right"
+description: "Enable a persistent object cache without shipping stale data or losing sessions: drop-in verification, key prefixes, memory sizing and invalidation rules."
+difficulty: Advanced
+timeToFix: "30–120 min"
+appliesTo: [WordPress Core, Redis, Memcached, WooCommerce, Hosting]
+tags: [performance, cache, hosting, woocommerce, object-cache]
+severity: Medium
+updated: 2025-12-08
+featured: true
+---
+
+## Symptoms
+
+- Admin and logged-in pages are slow although the frontend is fast (page cache only).
+- Stale content: edits are not visible until the cache is flushed.
+- Carts/sessions behaving strangely after enabling a persistent object cache.
+- Redis reports evictions, or the site intermittently falls back to the database.
+- After a deploy, old option values persist longer than expected.
+
+## Possible Causes
+
+1. Missing or broken `wp-content/object-cache.php` drop-in (the plugin is active but the drop-in was never installed).
+2. Wrong connection settings: host/port/auth/database index, or a socket path that does not exist.
+3. Shared Redis without a per-site key prefix → two sites overwriting each other's keys.
+4. Memory sizing too small (`maxmemory`), causing evictions and eventual thrash.
+5. Invalidation mistakes: direct SQL updates bypassing WordPress (safe, but cache-unaware), or plugins caching indefinitely.
+6. Sessions stored in the object cache evicted under memory pressure (WooCommerce cart loss).
+7. Two caching layers with conflicting expiry (page cache + object cache + WooCommerce session store).
+
+## Prerequisites
+
+- Redis/Memcached reachable from the site's server, with credentials.
+- A staging environment where you can flush caches safely.
+- Access to the drop-in file and to the caching plugin's settings.
+
+## Investigation
+
+1. **Verify the drop-in exists and which class it provides.**
+
+```bash
+ls -la wp-content/object-cache.php
+head -20 wp-content/object-cache.php
+wp cache type
+```
+
+2. **Test connectivity from PHP**, not only from the shell.
+
+```bash
+redis-cli -h 127.0.0.1 -p 6379 ping
+php -r '$r=new Redis();$r->connect("127.0.0.1",6379);echo $r->ping()."\n";'
+wp eval 'wp_cache_set("wsl_probe","ok"); echo wp_cache_get("wsl_probe")."\n";'
+```
+
+3. **Check sizing and eviction pressure.**
+
+```bash
+redis-cli INFO memory | grep -E 'used_memory_human|maxmemory_human|maxmemory_policy|mem_fragmentation'
+redis-cli INFO stats | grep -E 'evicted_keys|keyspace_hits|keyspace_misses|expired_keys'
+redis-cli --scan --pattern '*options' | head
+```
+
+4. **Confirm key isolation** between sites sharing the server.
+
+```bash
+redis-cli --scan | head -20
+wp eval 'echo WP_CACHE_KEY_SALT ?: "(no salt)";' 2>/dev/null || true
+```
+
+5. **Test invalidation**: publish a post, change an option, then read it back through the frontend and wp-admin.
+
+6. **WooCommerce specifically**: test a guest cart immediately after enabling the object cache ([session article](/woocommerce/cart-session-lost)).
+
+## Diagnosis
+
+| Observation | Cause | Fix |
+| --- | --- | --- |
+| Drop-in missing but plugin active | plugin could not write the file | fix permissions, re-install drop-in |
+| Connection error in debug log | wrong host/port/auth | correct config, test from PHP |
+| Keys from two sites interleaved | no prefix/salt | set unique prefix or database index |
+| `evicted_keys` rising | memory too small | raise `maxmemory`, add policy `allkeys-lru` |
+| Edits invisible until flush | over-long TTLs or broken invalidation | review TTLs, verify group flushing |
+| Carts lost under load | sessions evicted | separate Redis DB or dedicated instance |
+| No measurable improvement | cache not actually used | confirm `wp_cache_get` hits, check plugins bypassing API |
+
+::: investigate
+Investigation mindset: a cache is an optimisation with a correctness risk. Before enabling, define which data may be stale for how long — then verify invalidation, not just speed.
+:::
+
+## Resolution
+
+1. **Install/repair the drop-in** via the plugin or copy the reference implementation; confirm `wp cache type` reports the backend.
+2. **Configure isolation**: per-site key prefix or a dedicated database index; never share keys between environments (staging and production especially).
+3. **Size it properly**: budget memory for the whole working set (typically 128–512MB for a busy WooCommerce store), set an eviction policy, and monitor.
+4. **Keep sessions separate**: give WooCommerce sessions their own Redis database or instance so eviction cannot empty carts.
+5. **Review TTLs by data class**:
+
+| Data | Sensible TTL |
+| --- | --- |
+| Transients (API responses) | minutes to hours, as designed |
+| Options/autoload | indefinite but invalidated on write |
+| Queries (Query Monitor-visible) | short, group-flushed |
+| Sessions | expiry-based, dedicated storage |
+
+6. **Invalidate deliberately**: call `wp_cache_delete()`/`wp_cache_flush_group()` on content changes, and document which plugins do their own flushing.
+7. **Re-measure**: before/after numbers for TTFB on admin pages and logged-in views (see [/performance/ttfb](/performance/ttfb)).
+
+## Verification
+
+- `wp cache type` shows the persistent backend; probe set/get works.
+- wp-admin and logged-in pages are measurably faster (document numbers).
+- Publish → view immediately shows the new content on frontend and admin.
+- Guest cart persists across pages after enabling the cache.
+- `evicted_keys` stays flat under normal traffic.
+
+## Root Cause
+
+WordPress' object cache API is a key/value store with group-based invalidation. Making it persistent moves data outside the request — which is exactly why invalidation, isolation and memory sizing become correctness concerns.
+
+## Prevention
+
+- Ship object cache configuration as infrastructure code with monitoring (`evicted_keys`, memory, hit ratio).
+- Never share one Redis database between production and staging.
+- Include cache flush steps in deploy scripts and document who owns each layer.
+- Add cache correctness tests to the release checklist (publish → verify, cart → verify).
+
+## Related Articles
+
+- [/performance/ttfb](/performance/ttfb)
+- [/woocommerce/cart-session-lost](/woocommerce/cart-session-lost)
+- [/php/opcache](/php/opcache)
+- [/checklists/performance](/checklists/performance)
+
+## Official References
+
+- [WordPress: Object cache](https://developer.wordpress.org/reference/classes/wp_object_cache/)
+- [Redis: memory optimization](https://redis.io/docs/latest/operate/oss_and_stack/management/optimization/memory-optimization/)
+- [WordPress: Transients API](https://developer.wordpress.org/apis/transients/)

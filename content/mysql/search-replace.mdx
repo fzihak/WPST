@@ -1,0 +1,133 @@
+---
+title: "Search & Replace URLs After a Migration"
+description: "Why raw SQL breaks serialized data, how wp search-replace --precise works, and the verification steps that catch half-migrated sites before customers do."
+difficulty: Intermediate
+timeToFix: "20–60 min"
+appliesTo: [MySQL, Migration, WP-CLI]
+tags: [migration, database, wp-cli, redirect, hosting]
+severity: High
+updated: 2025-12-20
+featured: true
+---
+
+## Symptoms
+
+- Widgets, page-builder layouts or theme options empty after a domain/host change.
+- Feeds, links and images point to the old domain, or the site renders with wrong URLs.
+- `wp_options` looks correct but the frontend still uses the old domain.
+- Some content shows `s:22:"http://old-domain.com"` style garbage or a blank widget.
+
+## Possible Causes
+
+1. Raw `UPDATE … SET post_content = REPLACE(...)` ruining PHP-serialized strings (length prefixes no longer match).
+2. Migrating files but not running any search-replace, leaving `siteurl`/`home` on the old domain.
+3. Running search-replace but with a truncated table list (custom tables, `wp_blogs`, WooCommerce HPOS tables).
+4. Case or protocol differences (`http` vs `https`, `www` vs non-`www`) so replacements miss variants.
+5. Cached builder CSS/JSON still holding the old domain.
+
+## Prerequisites
+
+- Full database dump taken moments before the operation.
+- WP-CLI access (strongly preferred) and the ability to browse the site right after.
+- The exact old and new strings, including scheme and any `www`.
+
+## Investigation
+
+1. **Snapshot and inventory what needs changing.**
+
+```bash
+wp db export before-search-replace.sql
+wp option get siteurl && wp option get home
+# where do the old URLs live?
+wp db query "SELECT COUNT(*) c FROM wp_posts WHERE post_content LIKE '%//old.example.com%';"
+wp db query "SELECT COUNT(*) c FROM wp_postmeta WHERE meta_value LIKE '%//old.example.com%';"
+wp db query "SELECT option_name FROM wp_options WHERE option_value LIKE '%//old.example.com%' LIMIT 20;"
+```
+
+2. **Check for serialized data** — this is the trap. Look for `s:` length patterns in options/meta.
+
+```bash
+wp db query "SELECT option_name FROM wp_options WHERE option_value LIKE 'a:%' OR option_value LIKE 'O:%' LIMIT 10;"
+```
+
+3. **Run a dry run** and read the count per table; unexpected tables or zero counts are signals.
+
+```bash
+wp search-replace '//old.example.com' '//new.example.com' --all-tables --precise --dry-run
+```
+
+4. **Watch for strings that must NOT change** (a customer's email domain, an external service hostname, a staging URL in a snippet).
+
+```bash
+wp db query "SELECT ID, post_title FROM wp_posts WHERE post_content LIKE '%old.example.com%' AND post_content LIKE '%@old.example.com%' LIMIT 10;"
+```
+
+5. **Check builder/theme caches** that store their own CSS/JSON copies with old URLs.
+
+## Diagnosis
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Widgets/layouts blank, options broken | raw SQL broke serialization | restore the dump, use `--precise` |
+| Frontend still uses the old domain | `siteurl`/`home` unchanged | update those two options first |
+| Only custom tables wrong | table list incomplete | `--all-tables` (or explicit list) |
+| Mixed http/https results | variant not covered | run a second pass for the other scheme |
+| Fine in DB, wrong in HTML | cache/builder CSS | regenerate + purge |
+| Emails contain old links | templates or options | replace in options, verify templates |
+
+::: investigate
+Investigation mindset: URL migration is a data operation with a blast radius bigger than most people expect. Dry-run, count, snapshot, verify — in that order. Any shortcut here becomes an invisible content-loss ticket three weeks later.
+:::
+
+## Resolution
+
+1. **Fix the canonical options first**, then replace content.
+
+```bash
+wp option update siteurl 'https://new.example.com'
+wp option update home 'https://new.example.com'
+```
+
+2. **Replace safely** with `--precise` so serialized lengths are recalculated:
+
+```bash
+wp search-replace '//old.example.com' '//new.example.com' --all-tables --precise
+wp search-replace 'http://new.example.com' 'https://new.example.com' --all-tables --precise
+```
+
+3. **Handle deliberately excluded strings** with `--skip-columns` or by post-process clean-up after reviewing the dry run.
+4. **Rerun the inventory queries** to confirm zero remaining occurrences where they matter.
+5. **Rebuild caches**: object cache flush, page cache purge, builder CSS regeneration, and `wp rewrite flush`.
+6. **Test content types** across the stack: pages, posts, menus, widgets, builder pages, WooCommerce products, feeds, sitemaps.
+
+## Verification
+
+- Inventory queries return zero old-domain rows in `wp_posts`, `wp_postmeta`, `wp_options` (excluding intentional exceptions).
+- Builder pages and widgets render the same layout as before migration.
+- Feeds and sitemaps contain only new-domain URLs.
+- Site works over HTTPS with no mixed content ([/errors/mixed-content](/errors/mixed-content)).
+- Emails from a test order contain new-domain links.
+
+## Root Cause
+
+WordPress stores absolute URLs inside serialized PHP structures. A naive string replacement changes byte lengths, and PHP refuses to unserialize the result — turning options and meta into silent breakage.
+
+## Prevention
+
+- Never hand-edit serialized data; use `wp search-replace --precise` or a serializer-aware tool.
+- Include the dry run, the snapshot and the inventory queries in the migration checklist.
+- Keep the old host responsive with 301 redirects for at least 72 hours after cutover.
+- Verify with business-critical flows, not just the homepage.
+
+## Related Articles
+
+- [/migration/migrate-wordpress-site](/migration/migrate-wordpress-site)
+- [/errors/mixed-content](/errors/mixed-content)
+- [/mysql/database-repair](/mysql/database-repair)
+- [/checklists/migration](/checklists/migration)
+
+## Official References
+
+- [WP-CLI: search-replace](https://developer.wordpress.org/cli/commands/search-replace/)
+- [WordPress: Moving an existing installation](https://developer.wordpress.org/advanced-administration/upgrade/migrating/)
+- [PHP: Serialization](https://www.php.net/manual/en/function.serialize.php)

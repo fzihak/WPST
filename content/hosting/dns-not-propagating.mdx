@@ -1,0 +1,136 @@
+---
+title: "DNS Not Propagating (or Pointing at the Wrong Place)"
+description: "Prove propagation with authoritative lookups, understand TTL behaviour, and avoid the traps: proxied records, stale local caches and split DNS."
+difficulty: Intermediate
+timeToFix: "15–60 min (plus TTL wait)"
+appliesTo: [DNS, Hosting, CDN]
+tags: [dns, hosting, migration, cloudflare, ssl]
+severity: High
+updated: 2025-12-16
+---
+
+## Symptoms
+
+- Site shows the old host's page, a parking page, or "server not found" from some networks only.
+- Email stops arriving after a DNS change; some senders get bounces.
+- Two people see two different sites for the same domain.
+- Newly issued SSL fails validation because the challenge resolves to the old server.
+
+## Possible Causes
+
+1. Records were never saved, or saved on a different zone than the nameservers actually in use.
+2. TTL not lowered before cutover, so resolvers keep the old answer until expiry.
+3. Local caches: OS resolver cache, browser DNS, VPN, corporate DNS with long TTLs.
+4. Missing or wrong nameserver delegation between registrar and DNS provider.
+5. Proxied CDN records (A/CNAME) hiding the true origin, making "which IP is served?" ambiguous.
+6. Missing MX/TXT (SPF/DKIM/DMARC) records after moving DNS providers — mail breaks without any HTTP symptom.
+7. Split-horizon DNS (internal views) so employees see the old site while customers see the new one.
+
+## Prerequisites
+
+- Registrar access (delegation) and DNS zone access (records).
+- The intended target IP or hostname for the site and mail.
+- Patience budget: propagation is bounded by TTL, not by retries.
+
+## Investigation
+
+1. **Ask each layer separately** — authoritative first, then resolvers, then the client.
+
+```bash
+dig +short NS example.com                     # who is authoritative
+dig @ns1.authoritative.example.com example.com A +norec  # truth from the source
+dig +short @1.1.1.1 example.com A             # public resolver view
+dig +short @8.8.8.8 example.com A
+dig +short example.com AAAA
+```
+
+2. **Check delegation consistency** at the registry level.
+
+```bash
+whois example.com | grep -i 'name server'
+dig NS example.com @a.gtld-servers.net +norec
+```
+
+3. **Verify TTLs** so you can predict the wait instead of escalating it.
+
+```bash
+dig example.com A | grep -A1 'ANSWER SECTION'
+```
+
+4. **Check mail records after any DNS work** — HTTP working is not proof that DNS is complete.
+
+```bash
+dig +short MX example.com
+dig +short TXT example.com | grep -i spf
+dig +short TXT _dmarc.example.com
+```
+
+5. **Test the served site by IP** to confirm the target server actually serves the domain (no wrong vhost).
+
+```bash
+curl -sSI --resolve example.com:443:NEW_IP https://example.com/ | head -6
+```
+
+6. **Rule out client-side caches.**
+
+```bash
+# macOS
+sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder
+# Windows
+ipconfig /flushdns
+```
+
+## Diagnosis
+
+| Lookup result | Meaning | Action |
+| --- | --- | --- |
+| Authoritative returns new IP, resolvers old | propagation in progress | wait for TTL; keep old host warm |
+| Authoritative returns old IP | record not saved / wrong zone | fix the zone that is actually authoritative |
+| `SERVFAIL`/no answer | delegation/zone problem | fix registrar delegation or zone NS |
+| Correct A but wrong content | vhost/server mapping | fix the server's default site |
+| HTTP fine, mail broken | missing MX/SPF/DKIM/DMARC | restore mail records on the new provider |
+| Only some networks wrong | local/corporate cache | flush cache, verify from outside |
+
+::: investigate
+Investigation mindset: "DNS has not propagated" is usually inaccurate. Ask the authoritative server — it is either right or wrong, and that single command tells you whether you are waiting or fixing.
+:::
+
+## Resolution
+
+1. **Fix the zone that is authoritative** — most "propagation" issues are records edited in a zone nobody is using.
+2. **Lower TTL to 300s at least 24h before a planned change**, then raise it again after stability.
+3. **Restore the full record set** when migrating providers: A/AAAA, CNAME, MX, TXT (SPF, DKIM, verification), and any SRV entries.
+4. **Keep the old environment running** with a valid certificate for the rollback window; consider a temporary redirect from the old IP if it still answers.
+5. **Fix the server mapping** if lookups are correct but content is wrong: default vhost, document root, or SNI configuration.
+6. **Re-issue SSL** after DNS is verified — ACME challenges fail while records point at the old host ([/errors/ssl-handshake-failed](/errors/ssl-handshake-failed)).
+
+## Verification
+
+- Authoritative and at least two public resolvers return the same records for A, AAAA, CNAME, MX and TXT.
+- The site serves the expected content over HTTPS with a valid certificate when queried by IP resolve.
+- Test email delivered to Gmail/Outlook with SPF and DKIM passing.
+- A user outside your network confirms the site (customers see what you see).
+
+## Root Cause
+
+DNS answers are cached per resolver with a TTL, and zones are served by specific nameservers. Confusion between "the zone I edited" and "the zone that answers" is the most common source of phantom propagation problems.
+
+## Prevention
+
+- Document the DNS provider, nameservers and record set for each site.
+- Lower TTLs before planned migrations; add the step to the migration checklist.
+- Monitor certificate expiry and DNS record drift after every infrastructure change.
+- Test mail records as part of every DNS change, not only HTTP.
+
+## Related Articles
+
+- [/errors/ssl-handshake-failed](/errors/ssl-handshake-failed)
+- [/migration/migrate-wordpress-site](/migration/migrate-wordpress-site)
+- [/errors/err-too-many-redirects](/errors/err-too-many-redirects)
+- [/checklists/migration](/checklists/migration)
+
+## Official References
+
+- [Cloudflare: DNS records](https://developers.cloudflare.com/dns/manage-dns-records/)
+- [Let's Encrypt: Challenge types](https://letsencrypt.org/docs/challenge-types/)
+- [Google Public DNS: diagnostic lookups](https://developers.google.com/speed/public-dns/docs/dig-trace)

@@ -1,0 +1,140 @@
+---
+title: ".htaccess Errors and Safe Editing"
+description: "A bad line in .htaccess takes the whole site down with a 500. Learn the safe rebuild process, the directives that are not allowed where, and a hardening baseline."
+difficulty: Intermediate
+timeToFix: "10–45 min"
+appliesTo: [Apache, LiteSpeed, Hosting]
+tags: [apache, htaccess, hosting, redirect, security]
+severity: High
+updated: 2025-12-12
+featured: true
+---
+
+## Symptoms
+
+- Site-wide 500 immediately after editing `.htaccess` (frontend and admin).
+- "Internal Server Error" with `wp-admin` also failing but static files still serving.
+- Error log: `Invalid command 'php_value'`, `.htaccess: <directive> not allowed here`, `Options not allowed here`.
+- Redirects or rewrite rules silently ignored; permalinks 404.
+- Behaviour differs between hosts with identical file content.
+
+## Possible Causes
+
+1. A directive not permitted by the server: `php_value` under PHP-FPM, `Options` when `AllowOverride` is restrictive.
+2. Syntax error: unbalanced `<IfModule>`, missing `RewriteEngine On`, typo in a directive name.
+3. Rules that loop (rewrite redirecting to itself) — often combined with a CDN or proxy.
+4. Editing inside the `# BEGIN WordPress … # END WordPress` markers, which WordPress later rewrites.
+5. BOM/CRLF characters added by a GUI editor breaking the first line.
+6. A security or caching plugin writing rules that conflict with hand-written ones.
+
+## Prerequisites
+
+- A copy of the working `.htaccess` saved outside the webroot (`~/htaccess.backup`).
+- Panel or SFTP access (restoring by rename must be possible within seconds).
+- The site's error log for the exact Apache message.
+
+## Investigation
+
+1. **Restore service first** — rename, then rebuild. Never debug a live 500 from the same file.
+
+```bash
+cp .htaccess ~/htaccess.backup.$(date +%F-%H%M)
+mv .htaccess .htaccess.broken
+curl -sSI https://example.com/ | head -3     # site back? the file was the cause
+```
+
+2. **Read the exact server message** — it names the directive and the line.
+
+```bash
+tail -n 60 ~/logs/error_log | grep -i htaccess
+tail -n 60 /var/log/apache2/error.log | grep -iE 'htaccess|Invalid command|not allowed'
+```
+
+3. **Determine what the server allows.**
+
+```bash
+grep -R "AllowOverride" /etc/apache2/ 2>/dev/null | head
+php -i | grep -Ei 'Server API|Loaded Configuration'   # FPM? then php_value is wrong here
+curl -sS https://example.com/ -D - -o /dev/null | grep -i '^server'
+```
+
+4. **Rebuild in layers**: WordPress block only → confirm 200 → add one rule → confirm again. Two minutes per step beats an hour of guessing.
+5. **Watch for proxy/CDN interplay** — a rewrite that redirects to the same URL creates loops only when a CDN terminates TLS ([redirects article](/errors/err-too-many-redirects)).
+
+## Diagnosis
+
+| Error message | Cause | Fix |
+| --- | --- | --- |
+| `Invalid command 'php_value'` | PHP runs as FPM | use `.user.ini` or the panel |
+| `Options not allowed here` | `AllowOverride` too restrictive | host-level change or remove the line |
+| `.htaccess: <IfModule not closed` | syntax error | rebalance tags, validate before upload |
+| Redirect loop in the URL bar | rewrite to self / CDN | remove the duplicate rule |
+| Permalinks 404, no error | rewrite rules missing | restore the WordPress block, flush |
+| Only some rules apply | another plugin overwrites them | own rules outside the WP markers |
+
+::: investigate
+Investigation mindset: treat `.htaccess` like firewall rules — version it, keep a copy, change one line at a time, and always be able to say "restore the backup" in under thirty seconds.
+:::
+
+## Resolution
+
+1. **Rebuild the WordPress block** exactly as WordPress expects:
+
+```apache
+# BEGIN WordPress
+<IfModule mod_rewrite.c>
+  RewriteEngine On
+  RewriteRule .* - [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}]
+  RewriteBase /
+  RewriteRule ^index\.php$ - [L]
+  RewriteCond %{REQUEST_FILENAME} !-f
+  RewriteCond %{REQUEST_FILENAME} !-d
+  RewriteRule . /index.php [L]
+</IfModule>
+# END WordPress
+```
+
+2. **Add hardening rules above the block**, generated deliberately ([tools](/tools) builds a safe file): deny `wp-config.php`, disable directory indexes, block XML-RPC if unused, and deny PHP execution in uploads.
+3. **Never put PHP directives in `.htaccess` on FPM hosts**; use `.user.ini`:
+
+```ini
+memory_limit = 256M
+upload_max_filesize = 64M
+post_max_size = 64M
+max_execution_time = 300
+```
+
+4. **Version the file** — keep the canonical copy in the repo (as `htaccess.txt` for WordPress repos) and deploy it, rather than editing production by hand.
+5. **Verify `.htaccess` is actually used**: with `AllowOverride None` it is ignored, which explains "my rules do nothing" tickets.
+6. **After changes**, `wp rewrite flush`, purge caches, and re-test permalinks, uploads and redirect chains.
+
+## Verification
+
+- Frontend, admin, REST, permalinks and a static asset all return the expected status.
+- Error log shows the site's requests without new htaccess complaints.
+- Security checks pass: `wp-config.php` not readable over HTTP, directory listing disabled.
+- Redirect chain for the canonical URL is at most one hop.
+
+## Root Cause
+
+`.htaccess` is per-directory configuration executed by the web server on every request; a single invalid token makes Apache refuse all requests in that directory. AllowOverride further restricts which directives are even legal.
+
+## Prevention
+
+- Keep a golden `.htaccess` per host type in version control and deploy it.
+- Change one rule at a time on staging; validate on the same server software.
+- Add harden-up steps to the launch checklist so hardening is not ad hoc.
+- Document the host's AllowOverride/php_value capabilities for every site.
+
+## Related Articles
+
+- [/nginx/wordpress-rewrites](/nginx/wordpress-rewrites)
+- [/wordpress/permalinks-404](/wordpress/permalinks-404)
+- [/errors/500-internal-server-error](/errors/500-internal-server-error)
+- [/tools](/tools)
+
+## Official References
+
+- [Apache: .htaccess files](https://httpd.apache.org/docs/2.4/howto/htaccess.html)
+- [Apache: mod_rewrite](https://httpd.apache.org/docs/2.4/mod/mod_rewrite.html)
+- [WordPress: Hardening](https://developer.wordpress.org/advanced-administration/security/hardening/)

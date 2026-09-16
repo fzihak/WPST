@@ -1,0 +1,149 @@
+---
+title: "NGINX WordPress Rewrites and 504 Timeouts"
+description: "There is no .htaccess on NGINX. Get try_files, fastcgi timeouts, upload size and cache rules right — and know which upstream is producing your 504."
+difficulty: Advanced
+timeToFix: "20–90 min"
+appliesTo: [NGINX, PHP-FPM, Hosting]
+tags: [nginx, apache, hosting, redirect, gateway]
+severity: High
+updated: 2025-12-10
+---
+
+## Symptoms
+
+- Every page except the homepage returns 404 after moving from Apache.
+- `504 Gateway Time-out` on imports, exports, backups, report generation or large admin screens.
+- `413 Request Entity Too Large` on uploads/restores.
+- Assets cached too aggressively (or not at all) after a config change.
+- Works in a browser for admins but fails for visitors (cache vs FPM behaviour).
+
+## Possible Causes
+
+1. Missing `try_files` in the PHP location block, so pretty permalinks cannot route to `index.php`.
+2. `fastcgi_read_timeout` (default 60s) shorter than the operation's real duration.
+3. `client_max_body_size` too small for the upload or migration archive.
+4. FPM pool pressure: workers busy, so requests queue and time out.
+5. Caching directives applied to dynamic WordPress paths (cart, checkout, admin).
+6. Confusing origins: A missing/invalid `SOCKET` or an FPM pool that is not running.
+7. Proxy setups (CDN → NGINX → FPM) stacking timeouts, so the shortest one wins.
+
+## Prerequisites
+
+- Access to the vhost config (server block), not just the document root.
+- The error log for the exact upstream message.
+- A staging server block to test changes before reloading production.
+
+## Investigation
+
+1. **Read the error log first** — NGINX names the failing hop.
+
+```bash
+tail -n 200 /var/log/nginx/error.log | grep -Ei 'upstream|fastcgi|timed out|refused|no live'
+```
+
+2. **Confirm the rewrite configuration exists.**
+
+```bash
+nginx -T 2>/dev/null | grep -n -A4 'location /'
+nginx -T 2>/dev/null | grep -n 'try_files'
+```
+
+3. **Test the failing requests and measure duration** to compare against the configured timeout.
+
+```bash
+time curl -sS -o /dev/null -w '%{http_code}\n' https://example.com/checkout/
+time curl -sS -o /dev/null -w '%{http_code}\n' -F 'file=@big.zip' https://example.com/wp-admin/import.php
+```
+
+4. **Check FPM health.**
+
+```bash
+systemctl status php8.2-fpm
+tail -n 80 /var/log/php8.2-fpm.log | grep -Ei 'max_children|server reached'
+```
+
+5. **Validate before reloading** — always.
+
+```bash
+nginx -t && systemctl reload nginx
+```
+
+## Diagnosis
+
+| Log signature | Cause | Fix |
+| --- | --- | --- |
+| `upstream timed out` on `/index.php` | request > `fastcgi_read_timeout` | raise timeout, batch the job |
+| `no live upstreams` | FPM pool saturated | raise `pm.max_children`, cache |
+| 404 on all but `/` | missing `try_files` | add the WordPress location block |
+| 413 responses | `client_max_body_size` | raise it, and PHP `post_max_size` too |
+| 504 only from outside (CDN in front) | CDN timeout lower than origin | align timeouts |
+| Stale assets after deploy | `expires` without cache-busting | version assets, purge on deploy |
+
+::: investigate
+Investigation mindset: with NGINX you are configuring a proxy, not an application. Ask which hop timed out, and which timeout was the shortest — the shortest timeout defines your SLA whether you planned it or not.
+:::
+
+## Resolution
+
+1. **Minimal WordPress location blocks** (adapt paths to your PHP version):
+
+```nginx
+location / {
+  try_files $uri $uri/ /index.php?$args;
+}
+
+location ~ \.php$ {
+  include fastcgi_params;
+  fastcgi_pass unix:/run/php/php8.2-fpm.sock;
+  fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+  fastcgi_read_timeout 300;
+}
+
+location = /wp-config.php { deny all; }
+client_max_body_size 80m;
+```
+
+2. **Align timeouts across the chain**: NGINX `fastcgi_read_timeout` and `proxy_read_timeout`, PHP `max_execution_time`, and the CDN's origin timeout. Document the values in one place.
+3. **Raise upload limits at both layers**: `client_max_body_size` plus PHP `upload_max_filesize`/`post_max_size` ([memory article](/php/memory-limit)).
+4. **Cache only what is safe**: static assets with `expires`; never cart, checkout, my-account or admin paths. Bypass on session cookies where a cache plugin is not in charge.
+5. **Size FPM** from measured process memory:
+
+```ini
+pm = dynamic
+pm.max_children = 20       ; RAM / average PHP process size
+pm.max_requests = 500      ; recycle workers to avoid leaks
+```
+
+6. **Re-test the whole chain** after config changes: homepage, post, admin, checkout, upload, REST.
+
+## Verification
+
+- Pretty permalinks resolve for posts, CPTs, feeds and sitemaps.
+- The previously timing-out operation completes; error log shows no new upstream timeouts.
+- Uploads up to the documented size work end to end, including media library processing.
+- No caching of dynamic pages: cart/checkout responses show `no-store`/private caching.
+- `nginx -t` passes and config is in version control.
+
+## Root Cause
+
+NGINX delegates PHP to FastCGI and passes WordPress permalinks through `try_files`. Everything the `.htaccess` used to do must live in the vhost, and every operation is bounded by the shortest timeout in the chain.
+
+## Prevention
+
+- Keep the WordPress vhost as a versioned template with comments explaining each timeout.
+- Move long operations (imports, backups) to CLI/cron rather than web requests.
+- Monitor upstream error rates and FPM saturation, not just 5xx totals.
+- Test after every server/PHP upgrade with a scripted flow ([/checklists/pre-launch](/checklists/pre-launch)).
+
+## Related Articles
+
+- [/errors/502-bad-gateway](/errors/502-bad-gateway)
+- [/apache/htaccess](/apache/htaccess)
+- [/wordpress/permalinks-404](/wordpress/permalinks-404)
+- [/performance/ttfb](/performance/ttfb)
+
+## Official References
+
+- [NGINX: WordPress recipe](https://www.nginx.com/resources/wiki/start/topics/recipes/wordpress/)
+- [NGINX: fastcgi_module](https://nginx.org/en/docs/http/ngx_http_fastcgi_module.html)
+- [PHP-FPM configuration](https://www.php.net/manual/en/install.fpm.configuration.php)

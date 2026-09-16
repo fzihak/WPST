@@ -1,0 +1,134 @@
+---
+title: "OPcache: Stale Code After a Deploy"
+description: "Why your fix works on the server but not in the browser: OPcache validation, deploy-time resets, and the settings that keep PHP fast without hiding changes."
+difficulty: Intermediate
+timeToFix: "10–40 min"
+appliesTo: [PHP, Hosting, Deployment]
+tags: [php, opcache, performance, deployment, hosting]
+severity: Medium
+updated: 2025-12-14
+---
+
+## Symptoms
+
+- You changed a PHP file (plugin patch, child theme, `wp-config.php`) but behaviour does not change.
+- Two servers behave differently for identical code (one has a warm, stale cache).
+- Changes appear after a restart only — strong sign of OPcache.
+- Enabling OPcache broke a deploy process that used to "just work" on save.
+- 500 errors immediately after a deploy, resolved by restarting PHP.
+
+## Possible Causes
+
+1. `opcache.validate_timestamps=0` with no deploy-time reset.
+2. `opcache.revalidate_freq` too high for a workflow that deploys frequently.
+3. Multiple PHP versions/pools where only one was reset.
+4. Deploy writes files in place (non-atomic), so a request loads a half-written file into cache.
+5. `opcache.max_accelerated_files` too low for the installed file count, causing constant eviction and inconsistent behaviour.
+6. Cache too small for the plugin set, so hot files are dropped and performance degrades unpredictably.
+
+## Prerequisites
+
+- Knowledge of how PHP is run (FPM pool, LiteSpeed, mod_php) and where its ini lives.
+- Shell access to clear the cache or a hosting control that offers an OPcache reset button.
+- Deploy process documentation (this article is as much about process as about PHP).
+
+## Investigation
+
+1. **Confirm OPcache is enabled and how it is configured.**
+
+```bash
+php -i | grep -Ei 'opcache.enable|validate_timestamps|revalidate_freq|memory_consumption|max_accelerated_files'
+php -r 'print_r(opcache_get_status(false));' | head -20
+```
+
+2. **Test the stale-code hypothesis directly**: touch the file (updates mtime) and see whether behaviour changes without a restart.
+
+```bash
+touch wp-content/themes/child/functions.php
+php -r 'echo opcache_get_status()["opcache_statistics"]["num_cached_scripts"]."\n";'
+```
+
+3. **Reset explicitly** and observe whether the fix appears.
+
+```bash
+# FPM
+sudo systemctl reload php8.2-fpm
+# LiteSpeed
+/usr/local/lsws/bin/lshttpd -r
+# Any SAPI with a web trigger, if the host provides one:
+curl -sS https://example.com/opcache-reset.php   # then delete this file
+```
+
+4. **Check for multiple pools/versions** — the classic cause of "I reset it and nothing changed".
+
+```bash
+ls /etc/php/*/fpm/pool.d/ 2>/dev/null
+ps -eo cmd | grep -i 'php-fpm' | head
+```
+
+5. **Look at cache pressure metrics.**
+
+```bash
+php -r '$s=opcache_get_status(false);echo "oom_restarts=".$s["opcache_statistics"]["oom_restarts"]."\n";'
+```
+
+## Diagnosis
+
+| Observation | Cause | Fix |
+| --- | --- | --- |
+| Changes appear only after `systemctl reload` | validate_timestamps=0 | add reset to deploy, or set 1 |
+| `oom_restarts` > 0 growing | cache too small | raise `opcache.memory_consumption` |
+| `num_cached_scripts` plateauing high | `max_accelerated_files` too low | raise to 20000+ |
+| Reset had no effect | wrong pool/version | reset all FPM pools, confirm with phpinfo |
+| 500 right after deploy only | non-atomic writes + cache | write to temp then rename |
+| Inconsistent across nodes | resets not parallel | include reset in the deploy script for every node |
+
+::: investigate
+Investigation mindset: when "the fix is on the server" but the behaviour is unchanged, you are not debugging PHP — you are debugging *caching*. Confirm the code the process actually executes before you write a second patch.
+:::
+
+## Resolution
+
+1. **Choose a policy and document it**:
+
+| Policy | Settings | When it fits |
+| --- | --- | --- |
+| Validate every request | `validate_timestamps=1`, `revalidate_freq=0` | staging/dev |
+| Validate periodically | `validate_timestamps=1`, `revalidate_freq=2` | production with atomic deploys |
+| Never validate | `validate_timestamps=0` | immutable deploys with explicit reset |
+
+2. **Add the reset to the deploy pipeline** for every node and every pool.
+3. **Right-size the cache**: `memory_consumption` 192–256MB for large plugin sets, `max_accelerated_files` 20000, and `opcache.interned_strings_buffer` 16–32MB on builder-heavy sites.
+4. **Make deploys atomic**: write to a temporary file and `rename()` so no request can load a partial file ([deployment](/deployment/git-workflow) is on the roadmap).
+5. **Verify from PHP, not from your editor**: run a short `php -r` that prints the constant/function you changed.
+
+## Verification
+
+- After deploy: changed behaviour is live without a restart when using periodic validation, or immediately after the reset script runs.
+- `oom_restarts=0` and stable `num_cached_scripts` across a day.
+- Page load performance remains at the expected level (OPcache on, hit rate high).
+- Run two consecutive deploys and confirm behaviour changes both times — this proves the process, not luck.
+
+## Root Cause
+
+OPcache stores compiled PHP bytecode in shared memory, keyed by file. Whether fresh code is picked up depends on file timestamps and validation settings — a property of the runtime, not of the code you edited.
+
+## Prevention
+
+- Ship OPcache settings as code (idempotent config) and document every pool.
+- Include cache resets for PHP, object cache and page cache in the release checklist.
+- Monitor `oom_restarts` and hit ratio as leading indicators.
+- Test deploys twice in a row — single deploys hide stale-cache bugs.
+
+## Related Articles
+
+- [/performance/object-cache](/performance/object-cache)
+- [/php/memory-limit](/php/memory-limit)
+- [/performance/ttfb](/performance/ttfb)
+- [/wordpress/update-failed](/wordpress/update-failed)
+
+## Official References
+
+- [PHP: OPcache configuration](https://www.php.net/manual/en/opcache.configuration.php)
+- [PHP: opcache_get_status()](https://www.php.net/manual/en/function.opcache-get-status.php)
+- [PHP-FPM configuration](https://www.php.net/manual/en/install.fpm.configuration.php)

@@ -1,0 +1,148 @@
+---
+title: "Repair a Corrupted WordPress Database"
+description: "Table corruption, crashed tables and inconsistent data: check before you repair, snapshot before you touch, and know when InnoDB needs a different approach."
+difficulty: Advanced
+timeToFix: "45–180 min"
+appliesTo: [MySQL, MariaDB, phpMyAdmin, Hosting]
+tags: [mysql, database, corruption, backup, hosting]
+severity: Critical
+updated: 2025-12-22
+featured: true
+---
+
+## Symptoms
+
+- "Error establishing a database connection" alternating with pages that load partially.
+- MySQL log: `Table 'wp_options' is marked as crashed and should be repaired`, `Incorrect key file`, `#145`, `#1194`.
+- Random content loss, menus appearing empty, or options silently not saving.
+- Queries hanging, followed by connection timeouts.
+- Host notice after a disk-full incident or an ungraceful MySQL restart.
+
+## Possible Causes
+
+1. Ungraceful shutdown: power loss, OOM kill, host restart mid-write.
+2. Disk full or inode exhaustion while MySQL was writing.
+3. MyISAM tables (legacy) with no crash safety — one of the main reasons to migrate to InnoDB.
+4. Hardware/storage faults or a corrupted InnoDB tablespace.
+5. A runaway query or a plugin writing invalid data (rarely corruption, often "broken content").
+6. Restoring files without the matching database dump (mismatched state).
+
+## Prerequisites
+
+- **A snapshot you control**: file-level copy or a full dump before any repair.
+- `mysql` CLI access (phpMyAdmin works but CLI gives real errors).
+- Free disk space for repair operations and temporary files.
+- Confirmation of the storage engine of the affected tables.
+
+## Investigation
+
+1. **Freeze the state**: stop writes so the snapshot is meaningful.
+
+```bash
+wp maintenance-mode activate
+mysqldump --single-transaction --routines --triggers dbname > /home/user/backups/pre-repair.sql
+ls -lh /home/user/backups/pre-repair.sql
+```
+
+2. **Identify the engine and check every WordPress table** before repairing anything.
+
+```sql
+SELECT TABLE_NAME, ENGINE, TABLE_ROWS, DATA_LENGTH
+FROM information_schema.TABLES
+WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME LIKE 'wp_%';
+CHECK TABLE wp_options, wp_posts, wp_postmeta, wp_usermeta, wp_terms;
+```
+
+3. **Read MySQL's own error log** for the mechanism rather than guessing.
+
+```bash
+tail -n 120 /var/log/mysql/error.log
+grep -iE 'corrupt|crash|innodb|disk full' /var/log/mysql/error.log | tail -20
+df -h && df -i
+```
+
+4. **Check for the WordPress-side symptoms** that usually accompany corruption.
+
+```bash
+wp db check
+wp option get siteurl
+wp post list --post_type=post --format=count
+wp db query "SELECT COUNT(*) FROM wp_options WHERE autoload='yes';"
+```
+
+5. **Decide the strategy** based on engine and severity:
+
+| Scenario | Strategy |
+| --- | --- |
+| MyISAM crashed table | `REPAIR TABLE`, then migrate to InnoDB |
+| InnoDB single-table corrupt | Dump other tables, recreate, reimport |
+| InnoDB tablespace/redo corruption | Restore from backup; file-level recovery is expert territory |
+| Physical storage failing (I/O errors) | Migrate to new storage immediately |
+| Everything checks out but content is wrong | Wrong restore pairing, not corruption |
+
+::: danger
+Never run `REPAIR TABLE` on InnoDB as a "fix" and never delete files in the MySQL data directory to clear an error. Both turn a recoverable problem into data loss. Snapshot first, always.
+:::
+
+::: investigate
+Investigation mindset: corruption has a *cause* — disk, crash, storage, engine. Repairing the symptom while the cause persists guarantees a repeat, and often the second incident takes data with it.
+:::
+
+## Resolution
+
+1. **Repair cleanly, engine-appropriately:**
+
+```sql
+-- MyISAM only
+REPAIR TABLE wp_options;
+OPTIMIZE TABLE wp_postmeta;
+
+-- InnoDB: prefer a logical rebuild instead of REPAIR
+-- 1) dump the table, 2) drop/recreate via import, keeping the dump
+mysqldump dbname wp_options > wp_options.sql
+-- (verify the dump opens and contains INSERT statements before dropping)
+```
+
+2. **Restore-based recovery**: if the affected table is `wp_options` or `wp_posts` and you have a recent dump, importing that single table is usually faster and safer than repairing.
+3. **Migrate legacy engines to InnoDB** to reduce future risk:
+
+```sql
+ALTER TABLE wp_options ENGINE=InnoDB;
+```
+
+4. **Free space** if disk/inode exhaustion triggered the crash, and verify MySQL starts cleanly afterwards.
+5. **If InnoDB recovery mode is needed** (`innodb_force_recovery` 1–6), do it only on a copy, take a dump immediately, and never leave the setting enabled on production.
+6. **After repair, verify data integrity**: counts, options, users, recent posts and orders — compare with expectations before reopening the site.
+7. **Remove maintenance mode** and re-enable monitoring.
+
+## Verification
+
+- `CHECK TABLE` on all WordPress tables returns OK; `wp db check` is clean.
+- No new corruption errors for 24 hours including a MySQL restart.
+- Site functions: login, publish a post, place a test order (if WooCommerce), run cron.
+- Backups themselves are verified: restore the post-repair dump into a scratch database and browse it.
+
+## Root Cause
+
+MySQL crashes mid-write or runs out of space, leaving incomplete pages/redo state; MyISAM tables have no crash-safe recovery, so they surface as "crashed" tables. Storage-level faults produce the same symptoms without an obvious trigger.
+
+## Prevention
+
+- Always InnoDB; check for leftovers with `SHOW TABLE STATUS` in the quarterly DB audit.
+- Monitor disk/inode usage with an 85% alert threshold.
+- Use `mysqldump`, not file copies, for logical backups; verify restores.
+- Investigate every "MySQL restarted unexpectedly" event instead of dismissing it.
+- Keep MySQL/MariaDB patched, check the error log weekly, and run an optimize/cleanup pass on a schedule.
+
+## Related Articles
+
+- [/errors/error-establishing-database-connection](/errors/error-establishing-database-connection)
+- [/mysql/search-replace](/mysql/search-replace)
+- [/hosting/cpanel](/hosting/cpanel)
+- [/security/backups](/security/backups)
+
+## Official References
+
+- [MySQL: REPAIR TABLE](https://dev.mysql.com/doc/refman/8.0/en/repair-table.html)
+- [MySQL: InnoDB recovery](https://dev.mysql.com/doc/refman/8.0/en/innodb-recovery.html)
+- [MySQL: CHECK TABLE](https://dev.mysql.com/doc/refman/8.0/en/check-table.html)

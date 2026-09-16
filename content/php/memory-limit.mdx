@@ -1,0 +1,134 @@
+---
+title: "PHP Memory Limit: Set It Correctly, Not Blindly"
+description: "Where the limit lives (PHP, WordPress constant, host cap), how to size it by workload, and how to find what actually consumes the memory."
+difficulty: Intermediate
+timeToFix: "20–60 min"
+appliesTo: [PHP, WordPress Core, Hosting, WooCommerce]
+tags: [php, memory, hosting, performance, woocommerce]
+severity: High
+updated: 2025-12-15
+featured: true
+---
+
+## Symptoms
+
+- "Allowed memory size of N bytes exhausted" in logs or admin.
+- Backend operations fail while the frontend is fine (imports, builder saves, exports, bulk actions).
+- PHP-FPM/OOM kills on the server during heavy requests.
+- Hosting plan reports memory peaks that trigger throttling notices.
+
+## Possible Causes
+
+1. `memory_limit` under-provisioned for the workload (WooCommerce + builder + LMS stacks).
+2. `WP_MEMORY_LIMIT` set in `wp-config.php` but overridden (or ignored) by the host's PHP setting.
+3. Load order mistake: `php_value` in `.htaccess` under PHP-FPM (ignored), or `.user.ini` not refreshed.
+4. Genuine runaway usage: loops, imports without batching, keeping large result sets in memory.
+5. Bloated autoloaded options loaded on every request.
+
+## Prerequisites
+
+- Knowledge of how PHP is executed on the host (mod_php, PHP-FPM/`.user.ini`, or panel-managed).
+- The actual fatal message with the allocation size and file path.
+- A staging copy for reproducing heavy operations.
+
+## Investigation
+
+1. **Establish the three values in play.**
+
+```bash
+php -i | grep -i 'memory_limit'              # CLI value (often differs!)
+wp eval 'echo "php=".ini_get("memory_limit")." wp=".WP_MEMORY_LIMIT." max=".WP_MAX_MEMORY_LIMIT."\n";'
+curl -sS https://example.com/wp-admin/site-health.php -o /dev/null -w '%{http_code}\n'
+# Site Health → Info → Server shows the web-request limit
+```
+
+2. **Determine the execution model** so you edit the right file.
+
+```bash
+ls -la phpinfo.php 2>/dev/null            # if present (remove afterwards)
+php -i | grep -Ei 'Server API|Loaded Configuration File|Scan this dir'
+```
+
+| Server API | Correct place to set the limit |
+| --- | --- |
+| apache2handler (mod_php) | `.htaccess` `php_value` or panel |
+| fpm-fcgi | `.user.ini`, panel, or FPM pool config |
+| litespeed | panel / `.htaccess` `php_value` |
+| cli | `php.ini` or `-d memory_limit=…` |
+
+3. **Measure actual peak usage** rather than guessing the ceiling.
+
+```bash
+wp eval 'printf("peak=%.1fMB limit=%s\n", memory_get_peak_usage(true)/1048576, ini_get("memory_limit"));'
+wp eval 'foreach (get_option("active_plugins") as $p) { $s = @filesize(WP_PLUGIN_DIR."/$p"); } echo count(get_option("active_plugins"))." plugins\n";'
+```
+
+4. **Find the call site** in the fatal's stack trace and with Query Monitor on a reproduction.
+
+5. **Check autoload bloat**, a frequent root cause of "it worked with fewer plugins".
+
+```sql
+SELECT SUM(LENGTH(option_value)) total_mb, COUNT(*) options FROM wp_options WHERE autoload='yes';
+SELECT option_name, LENGTH(option_value) FROM wp_options WHERE autoload='yes' ORDER BY 2 DESC LIMIT 10;
+```
+
+## Diagnosis
+
+| Observation | Cause | Action |
+| --- | --- | --- |
+| CLI limit ≠ web limit | different ini files | set the web path correctly |
+| `WP_MEMORY_LIMIT` set, PHP lower | constant raised but the ceiling still applies | raise at PHP layer too |
+| Peak usage near the limit on ordinary pages | autoload/plugin bloat | trim autoloaded options and plugins |
+| Peak spikes only on imports/exports | unbounded loops | batch the operation |
+| OOM kill instead of PHP fatal | server-level memory | size the pool, add cache, reduce workers |
+| Fatal in a specific admin screen | that plugin's data load | paginate or replace the plugin |
+
+::: investigate
+Investigation mindset: a limit is a budget, not a fix. Measure the peak first — if a blog listing needs 400MB, you have a bug, not a config problem.
+:::
+
+## Resolution
+
+1. **Raise the limit at the correct layer** (panel for managed hosts; `.user.ini`/`php.ini` for FPM; `php_value` only under mod_php), then reload PHP.
+2. **Set WordPress constants to match**, with the admin/cron ceiling higher than the frontend baseline:
+
+```php
+define( 'WP_MEMORY_LIMIT', '256M' );
+define( 'WP_MAX_MEMORY_LIMIT', '512M' );
+```
+
+3. **Size by workload** using the environment sizer ([tools](/tools)): brochure 256M, WooCommerce 512M, LMS/complex 512–768M, plus ~128M if a builder is used.
+4. **Fix the mechanism**: batch imports in chunks, add pagination to admin screens, cache expensive results, remove duplicate plugins.
+5. **Trim autoloaded options** after a backup, then verify performance and no regressions.
+6. **Address server-level memory** separately: increase container memory or reduce `pm.max_children` so kills stop ([502 article](/errors/502-bad-gateway)).
+
+## Verification
+
+- The original failing operation completes; observed peak stays below the limit with headroom (aim ≤ 70%).
+- `php -i`/Site Health confirm the intended limit for web requests.
+- No `memory exhausted` entries for 24 hours, including cron and admin imports.
+- Frontend TTFB unchanged or better (limite changes must not mask a performance regression).
+
+## Root Cause
+
+PHP allocates memory per request up to a configured ceiling; every plugin and every data set contributes. Fatal messages exist because the ceiling was reached — the engineering question is which part of the workload pushed it there.
+
+## Prevention
+
+- Document limit decisions per environment and set them at provisioning ([/checklists/pre-launch](/checklists/pre-launch)).
+- Monitor peak usage per template; alert before fatals.
+- Keep autoloaded options lean and re-audit quarterly.
+- Convert batch operations to chunked background jobs.
+
+## Related Articles
+
+- [/errors/allowed-memory-size-exhausted](/errors/allowed-memory-size-exhausted)
+- [/php/opcache](/php/opcache)
+- [/hosting/cpanel](/hosting/cpanel)
+- [/checklists/performance](/checklists/performance)
+
+## Official References
+
+- [PHP: runtime configuration](https://www.php.net/manual/en/ini.core.php)
+- [PHP-FPM configuration](https://www.php.net/manual/en/install.fpm.configuration.php)
+- [WordPress: Editing wp-config.php](https://developer.wordpress.org/advanced-administration/wordpress/wp-config/)

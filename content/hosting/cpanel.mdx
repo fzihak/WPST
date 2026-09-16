@@ -1,0 +1,117 @@
+---
+title: "cPanel Crash Course for WordPress Support"
+description: "The panels, paths and tools that matter during an incident: File Manager, DNS Zone Editor, PHP Selector, cron, SSL/TLS, email deliverability and logs."
+difficulty: Beginner
+timeToFix: "reference"
+appliesTo: [cPanel, Hosting, WordPress]
+tags: [hosting, cpanel, dns, ssl, cron, logs]
+severity: Medium
+updated: 2025-12-18
+featured: true
+---
+
+## Symptoms
+
+- You have panel access but the ticket is urgent and you need the right screen immediately.
+- WordPress says an error; the panel shows a different one (or nothing at all).
+- You are handed a hosting account with no documentation and a customer waiting.
+
+## Possible Causes
+
+This article is a reference rather than a failure page: it maps the panel to the support tasks that arise in WordPress incidents.
+
+## Prerequisites
+
+- Panel credentials with the least privilege that still allows the task (avoid reseller/WHM access unless required).
+- The site's document root (usually `public_html`, sometimes a subdomain folder).
+- A backup before file/DNS/SSL changes.
+
+## Investigation
+
+1. **Identify the account layout** — document root, PHP version, web server.
+
+```text
+File Manager → public_html      → WordPress root
+File Manager → logs/            → access + error logs (if available)
+Metrics → Resource Usage        → CPU/RAM/entry processes
+MultiPHP Manager / Select PHP   → PHP version + extensions
+```
+
+2. **Map incident → panel location:**
+
+| Need | cPanel location | Notes |
+| --- | --- | --- |
+| Read PHP/access logs | File Manager → `logs/`, Metrics | Some hosts expose "Errors" in the panel UI |
+| PHP version/limits | MultiPHP INI Editor / PHP Selector | `memory_limit`, `max_input_vars`, `upload_max_filesize` |
+| DNS records | Zone Editor | TTL, A/CNAME/MX/TXT; lower TTL before cutovers |
+| SSL | SSL/TLS Status, AutoSSL | Run AutoSSL after DNS/redirect fixes |
+| cron | Cron Jobs | Never run WP-Cron more often than every 5 minutes |
+| DB access | phpMyAdmin, MySQL Databases | Export before repair |
+| Files | File Manager | Supports edit/upload/permissions (verify modes after) |
+| Mail deliverability | Email Deliverability | Shows missing SPF/DKIM/DMARC records |
+| Traffic limits | Resource Usage | Explains 503/suspended-account tickets |
+
+3. **Check the numbers that cause most incidents.**
+
+```bash
+du -sh public_html ~/logs                    # disk
+df -h; df -i                                  # host-level space/inodes
+ls -la ~/logs | head                          # log availability
+```
+
+4. **Verify WordPress-level state from the panel or CLI side by side** so you can prove that the panel's view and WordPress' view agree.
+
+```bash
+wp core version --path=~/public_html
+wp plugin status --path=~/public_html | head
+```
+
+::: investigate
+Investigation mindset: the panel is a *second source of truth*. When WordPress and the panel disagree (e.g. PHP version), you have found the ticket — configuration was applied at one layer only.
+:::
+
+## Diagnosis
+
+- Panel shows a lower PHP version than WordPress reports → the site uses a different handler (`.user.ini`, `php.ini`, FPM pool).
+- Panel cron jobs missing → site relies on WP-Cron only, so maintenance is traffic-dependent.
+- Resource Usage shows CPU/EP in the red during the incident window → capacity/traffic problem, not code.
+- Zone Editor shows a proxied CNAME/DNS mismatch → SSL/redirect issues at the edge.
+
+## Resolution
+
+1. Do the minimal change in the right place, then verify from WordPress' perspective (`wp --info`, `php -i`) rather than trusting the UI.
+2. Keep a per-site panel runbook: document root, PHP version/settings, cron entries, DNS provider, SSL source, caching layer, backup schedule.
+3. Prefer File Manager operations that preserve ownership; verify permissions after any upload (files 644, dirs 755, `wp-config.php` 600).
+4. Use the panel's built-in backup before repairs, and confirm the archive opens.
+5. When capacity limits are the cause, decide deliberately: optimise first, upgrade second, and record the decision.
+
+## Verification
+
+- Panel and WordPress report the same PHP version and limits.
+- Cron list matches the documented set; logs show runs.
+- SSL status is valid with the expected issuer for every hostname.
+- Resource Usage returns to normal under regular traffic.
+
+## Root Cause
+
+Most hosting tickets are misconfigurations that live in the panel but surface in WordPress (or vice versa). A documented mapping between the two layers is what makes resolution fast.
+
+## Prevention
+
+- Keep a hosting runbook per site with panel screenshots and paths.
+- Verify PHP limits during launch, not during an incident.
+- Configure cron, SSL automation and backups at provisioning time.
+- Review Resource Usage trends monthly to anticipate upgrades ([/checklists/performance](/checklists/performance)).
+
+## Related Articles
+
+- [/hosting/dns-not-propagating](/hosting/dns-not-propagating)
+- [/hosting/ftp-sftp](/hosting/ftp-sftp)
+- [/php/memory-limit](/php/memory-limit)
+- [/runbooks/site-down](/runbooks/site-down)
+
+## Official References
+
+- [cPanel documentation](https://docs.cpanel.net/)
+- [WordPress: File permissions](https://developer.wordpress.org/advanced-administration/server/file-permissions/)
+- [LetsEncrypt: AutoSSL & challenges](https://letsencrypt.org/docs/challenge-types/)
