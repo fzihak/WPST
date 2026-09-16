@@ -1,0 +1,130 @@
+---
+title: "Checkout Page Broken or Not Loading"
+description: "Blank checkout, spinner that never resolves, or a fatal on Place Order. Triage PHP fatals, AJAX/WAF blocks, HPOS incompatibility and cached pages."
+difficulty: Advanced
+timeToFix: "30–120 min"
+appliesTo: [WooCommerce, Plugins, Hosting, WAF]
+tags: [woocommerce, checkout, ajax, plugin, hpso]
+severity: Critical
+updated: 2025-12-26
+---
+
+## Symptoms
+
+- Checkout renders partially: fields missing, "Place order" button does nothing.
+- Infinite spinner on submit; no order is created.
+- Fatal error or "critical error" on the checkout page.
+- Works in the block-based checkout but not the shortcode checkout (or vice versa).
+- Intermittent under load; always fails for specific customers/payment methods.
+
+## Possible Causes
+
+1. PHP fatal in a checkout hook (payment plugin, custom snippet, address validation service).
+2. `wc-ajax`/`admin-ajax` blocked by a security plugin or WAF (403) — very common.
+3. Cart/checkout cached (nonce invalid) or served by a CDN with stale fragments.
+4. HPOS incompatibility in a plugin reading orders from `wp_posts` directly.
+5. Outdated template override in the theme's `woocommerce/` folder.
+6. Server limits: `max_input_vars`, memory, or timeout on the checkout request.
+7. Block checkout/classic checkout mismatch: plugins providing fields only for one mode.
+
+## Prerequisites
+
+- Staging copy with the same plugin set and payment gateway in test mode.
+- WooCommerce System Status Report (templates + HPOS status).
+- Logging enabled and access to the access log for AJAX endpoints.
+
+## Investigation
+
+1. **Define the failure precisely**: does the page render, and does the AJAX request fail?
+
+```bash
+curl -sS -o /dev/null -w 'checkout=%{http_code} %{size_download}b\n' https://example.com/checkout/
+curl -sS -o /dev/null -w 'wcajax=%{http_code}\n' https://example.com/?wc-ajax=checkout
+```
+
+2. **Read the console and the network payload** for the `wc-ajax=checkout` request: status, response body and any JSON error.
+
+```bash
+tail -n 60 wp-content/debug.log
+grep -iE 'wc-ajax|checkout' ~/logs/*access*.log | tail -20
+```
+
+3. **Check the template overrides** — outdated copies are a classic silent breaker.
+
+```bash
+ls -R wp-content/themes/active-theme/woocommerce | head -30
+wp eval 'foreach (WC()->plugin_path() ? [] : [] as $x) {}' 2>/dev/null
+# inspect WooCommerce → Status → Templates for "overridden (outdated)"
+```
+
+4. **Confirm HPOS state and plugin compatibility.**
+
+```bash
+wp option get woocommerce_custom_orders_table_enabled
+wp option get woocommerce_feature_custom_order_tables_enabled
+```
+
+5. **Test with the security/cache layers disabled** (staging): WAF blocks on `wc-ajax` usually show as 403 with no PHP log entry.
+
+6. **Check limits** because long checkouts with many fields and API calls hit them.
+
+```bash
+wp eval 'echo ini_get("memory_limit")." ".ini_get("max_input_vars")." ".ini_get("max_execution_time")."\n";'
+```
+
+## Diagnosis
+
+| Evidence | Cause | Layer |
+| --- | --- | --- |
+| 403 on `wc-ajax=checkout` | WAF/security plugin | edge/security |
+| 500 with empty body | PHP fatal | plugin/snippet |
+| JSON response with `error` + message | validation/gateway logic | WooCommerce/gateway |
+| Page renders but stuck spinner, request 200 | JS error or nonce mismatch | theme/cache |
+| Only for high-value carts | timeout/limits | hosting |
+| Only with one payment method | gateway plugin | payment integration |
+| Template outdated warning | theme override | theme |
+
+::: investigate
+Investigation mindset: the checkout is the most complex request in WordPress — session, cart, hooks, gateway calls and order creation in one shot. Split it: does the page load, does the AJAX call reach PHP, does order creation succeed? Each answer halves the search space.
+:::
+
+## Resolution
+
+1. **Fix the fatal** by isolating the plugin/snippet in the failing hook (halving method on staging).
+2. **Whitelist checkout endpoints** in the WAF/security plugin: `wc-ajax`, `admin-ajax` with WooCommerce nonces, and the gateway callback routes.
+3. **Refresh templates**: delete outdated overrides and re-copy the current WooCommerce templates, then re-apply your modifications (document them template by template).
+4. **Fix HPOS compatibility**: update plugins, or enable compatibility mode while you migrate. Never mix direct `wp_posts` order queries with HPOS tables.
+5. **Raise limits where justified** (`max_input_vars` 5000+, memory 512M, `max_execution_time` 300) and move heavy side effects (emails, inventory syncs, CRM pushes) into background jobs.
+6. **Decide one checkout mode**: classic shortcode or block checkout — and verify every customisation plugin supports it.
+7. **Purge caches** and confirm checkout is excluded from page cache.
+
+## Verification
+
+- Complete 3 guest orders + 2 logged-in orders in test mode, including one with a coupon and one with shipping.
+- Order created, email sent, stock reduced, gateway log clean, thank-you page correct.
+- No 4xx/5xx for `wc-ajax` in a full day of access logs.
+- Works at daily peak traffic (or under a small load test), not just at 3am.
+
+## Root Cause
+
+The checkout combines session state, many plugin hooks and a third-party API call. Failures come from one of four places: PHP execution, edge security, template/session state, or the gateway integration.
+
+## Prevention
+
+- Run the WooCommerce checklist before each release and after each store update ([/checklists/woocommerce](/checklists/woocommerce)).
+- Never let a WAF go live without an explicit exception list for checkout paths.
+- Keep overrides minimal and documented; prefer hooks over template copies.
+- Alert on `wc-ajax` error rate and failed-order count.
+
+## Related Articles
+
+- [/woocommerce/payment-failed](/woocommerce/payment-failed)
+- [/woocommerce/cart-session-lost](/woocommerce/cart-session-lost)
+- [/plugins/plugin-conflict](/plugins/plugin-conflict)
+- [/decision-trees/checkout-failing](/decision-trees/checkout-failing)
+
+## Official References
+
+- [WooCommerce: Checkout block](https://woocommerce.com/document/woocommerce-blocks/)
+- [WooCommerce: HPOS](https://woocommerce.com/document/high-performance-order-storage/)
+- [WooCommerce: Template structure & overrides](https://woocommerce.com/document/template-structure/)

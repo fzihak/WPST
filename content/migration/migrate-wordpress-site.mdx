@@ -1,0 +1,117 @@
+---
+title: "Migrate a WordPress Site End to End"
+description: "Host change, domain change or staging promotion: the full sequence with verification gates, so nothing is forgotten — cron, DNS, SSL, webhooks, redirects."
+difficulty: Advanced
+timeToFix: "1–4 hours + DNS TTL"
+appliesTo: [Migration, Hosting, MySQL, DNS]
+tags: [migration, hosting, database, dns, checklist]
+severity: Critical
+updated: 2025-11-28
+featured: true
+---
+
+## Symptoms
+
+- You are moving a site between hosts, domains, or from staging to production and need a repeatable process.
+- Previous migrations produced "small" regressions: broken widgets, missing images, emails from the old domain, cron not running.
+- Downtime windows are unacceptable, so you need a plan that keeps the old site serving until cutover.
+
+## Possible Causes
+
+This is a procedure article: the "causes" of migration incidents are the skipped steps below — search-replace, cron, DNS records, callbacks and cache.
+
+## Prerequisites
+
+- Full backup of files + database, verified by opening the archive.
+- Target environment provisioned: PHP version, limits, extensions, web server, SSL capability.
+- A maintenance window (or a low-traffic window) plus a rollback plan with the old host kept warm.
+- Inventory list: cron jobs, SMTP, CDN, payment/webhook URLs, API keys, redirects, .user.ini, custom `.htaccess` rules.
+
+## Investigation
+
+1. **Baseline the source** so you can prove equivalence after the move.
+
+```bash
+wp core version && php -v | head -1 && mysql --version
+wp plugin list --fields=name,version,status
+wp theme list --status=active --fields=name,version
+wp option get siteurl && wp option get home
+wp cron event list --fields=hook,next_run_gmt | head -20
+```
+
+2. **Lower TTL** on DNS records to 300s at least 24h before cutover.
+
+3. **Stage the migration on the target first** (temporary hosts file or a bypass URL) and test there — never test the new host for the first time after DNS change.
+
+```bash
+# verify the target serves the site before touching DNS
+curl -sSI --resolve example.com:443:TARGET_IP https://example.com/ | head -5
+```
+
+## Diagnosis
+
+| Symptom after migration | Missed step |
+| --- | --- |
+| Widgets/layouts empty, wrong URLs | `wp search-replace` not run (or run without `--precise`) |
+| Permalinks 404 | rewrite rules not provisioned on the new server |
+| Scheduled posts/emails not sending | cron not recreated |
+| Emails from old domain or bounce | SMTP/From address not updated, DNS records missing |
+| Payments fail | gateway callback URLs not updated |
+| Mixed content warnings | scheme change without replacement |
+| Random 500s | permissions/ownership/PHP version mismatch |
+| Images missing | files not fully transferred, or `uploads` excluded |
+
+## Resolution
+
+The migration sequence, with verification gates:
+
+1. **Freeze the source** (maintenance mode) and snapshot it.
+2. **Transfer files** (rsync preferred, FTP for simplicity) excluding caches/logs/backups; then **recreate caches** on the target.
+3. **Move the database** and import it; then fix credentials and salts in `wp-config.php`.
+4. **Run a serializer-safe replacement** if the domain changed ([search-replace](/mysql/search-replace)).
+
+```bash
+wp search-replace '//old.example.com' '//new.example.com' --all-tables --precise --dry-run
+wp search-replace '//old.example.com' '//new.example.com' --all-tables --precise
+wp cache flush && wp rewrite flush --hard
+```
+
+5. **Set ownership/modes** on the target ([permissions](/security/file-permissions)).
+6. **Recreate the surrounding services**: cron jobs, SMTP, CDN, object cache, backups, monitoring, WAF rules.
+7. **Update external callbacks**: payment gateways, webhooks, OAuth redirect URIs, third-party APIs with IP/domain allowlists.
+8. **Test via hosts-file override** (or `--resolve`): login, form submit, checkout in test mode, email send, search, feed.
+9. **Cut over DNS** and keep the old environment available for rollback for 72 hours.
+10. **Post-cutover verification**: redirect chains, SSL on every hostname, sitemap submission, analytics property, and a crawl for 404/5xx spikes.
+11. **Close out** with a documented diff (versions before/after, changes made, rollback steps) in the ticket.
+
+## Verification
+
+- Baseline commands from step 1 produce equivalent output on the target.
+- Homepage, wp-login, one form, one checkout, one email and one cron run all verified as a logged-out user.
+- `curl -sSIL` shows a clean redirect chain, valid certificate on apex + www.
+- Paid/key integrations confirmed by a real (low-value) transaction or test-mode order.
+- Monitoring shows no 5xx spike in the first 24 hours.
+
+## Root Cause
+
+Migrations fail through omissions, not difficulty: the sequence has ~20 required steps and no compiler to enforce them. A written checklist plus verification gates converts a scary operation into a routine one.
+
+## Prevention
+
+- Use the migration checklist on every move, even "small" staging promotions ([/checklists/migration](/checklists/migration)).
+- Keep the site in Git so code can be deployed, not copied.
+- Document the environment inventory per site; it is also your rollback plan.
+- Run a practice migration into a scratch environment before the real one.
+
+## Related Articles
+
+- [/mysql/search-replace](/mysql/search-replace)
+- [/hosting/dns-not-propagating](/hosting/dns-not-propagating)
+- [/checklists/migration](/checklists/migration)
+- [/security/backups](/security/backups)
+
+## Official References
+
+- [WordPress: Moving an existing installation](https://developer.wordpress.org/advanced-administration/upgrade/migrating/)
+- [WP-CLI: search-replace](https://developer.wordpress.org/cli/commands/search-replace/)
+- [WordPress: Changing the site URL](https://wordpress.org/documentation/article/changing-the-site-url/)

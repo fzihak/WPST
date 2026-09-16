@@ -1,0 +1,144 @@
+---
+title: "Brute Force and Login Hardening"
+description: "Reported by the host for resource abuse, locked out by firewalls, or seeing thousands of failed logins: mitigate at the edge, then harden the accounts."
+difficulty: Intermediate
+timeToFix: "30–90 min"
+appliesTo: [Security, Hosting, CDN, WordPress Core]
+tags: [security, brute-force, hosting, cloudflare, logs]
+severity: High
+updated: 2025-11-22
+featured: false
+---
+
+## Symptoms
+
+- Hosting notice: resource limits exceeded, thousands of PHP processes, or high CPU from `wp-login.php`.
+- Login page slow or returning 503 during attack windows.
+- Users locked out or seeing CAPTCHAs; your own IP is blocked.
+- Access log full of POSTs to `wp-login.php` and `xmlrpc.php`, often with a single user agent.
+- New "users" in WordPress, or password reset emails you did not request.
+
+## Possible Causes
+
+1. Distributed credential stuffing against `wp-login.php` and `xmlrpc.php` (systematic, not personal).
+2. Weak or reused administrator passwords (the attack succeeds because it can).
+3. Username enumeration: author archives, `?author=1`, or the REST API exposing login names.
+4. No rate limiting at the edge, so every attempt costs PHP.
+5. XML-RPC left enabled with `system.multicall`, which amplifies attempts.
+6. Application passwords or API keys leaked from a compromised integration.
+
+## Prerequisites
+
+- Access log samples for the attack window (even 200 lines are enough to quantify).
+- Panel/CDN access to add rate limits and blocks.
+- A list of administrator accounts, and a plan for forcing password resets if necessary.
+
+## Investigation
+
+1. **Quantify the attack** before acting: volume, targets, sources, user agents.
+
+```bash
+grep -c 'POST /wp-login.php' access.log
+awk '$6 ~ /wp-login.php|xmlrpc.php/ {print $1}' access.log | sort | uniq -c | sort -rn | head
+awk '$6 ~ /wp-login.php/ {print $1}' access.log | sort -u | wc -l      # distinct IPs
+grep 'xmlrpc.php' access.log | wc -l
+```
+
+2. **Check whether attempts are cheap or expensive** (a real risk of 503).
+
+```bash
+grep -c ' 200 ' access.log
+grep -c ' 403 ' access.log
+```
+
+3. **Assess the accounts** being targeted and whether any succeeded.
+
+```bash
+wp user list --role=administrator --fields=ID,user_login,user_registered,user_email
+grep 'POST /wp-login.php HTTP' access.log | grep ' 302 ' | tail -20   # 302 = login success
+```
+
+4. **Check for enumeration surfaces.**
+
+```bash
+curl -sS -o /dev/null -w '/?author=1 → %{redirect_url}\n' https://example.com/?author=1
+curl -sS https://example.com/wp-json/wp/v2/users | head -c 200
+```
+
+5. **Verify your mitigations exist** (rate limit, 2FA, WAF rules) rather than assuming.
+
+```bash
+wp plugin list --status=active | grep -iE 'wordfence|limit|cerber|two|2fa'
+```
+
+## Diagnosis
+
+| Observation | Risk | Fix |
+| --- | --- | --- |
+| Tens of thousands of POSTs from many IPs | distributed stuffing | edge rate limits + challenge, not IP blocking alone |
+| A single IP with high volume | targeted attacker | block IP, keep logs as evidence |
+| `302` responses on login POSTs | possible successful access | force password resets, audit users/plugins |
+| `xmlrpc.php` with high counts | amplification | disable XML-RPC unless required |
+| `/?author=1` redirects with username | enumeration | disable author archives or hide usernames |
+| Host CPU from PHP only | no edge protection | add CDN/WAF in front of login |
+| Account locked for legit users | over-aggressive rules | tune rules, allowlist office IPs |
+
+::: investigate
+Investigation mindset: brute force is a *capacity and credential* problem, not a code problem. Shed the load at the edge, then fix the accounts — in that order, because the site must stay online while you harden.
+:::
+
+## Resolution
+
+1. **Shed load at the edge** (fastest, most effective):
+   - Rate limit `POST /wp-login.php` (e.g. 5/minute per IP) with a challenge, not a permanent block.
+   - Block or rate limit `xmlrpc.php` for anonymous traffic.
+   - Enable bot-fight/managed challenge during attack windows; it stops most stuffing traffic.
+2. **Harden accounts**: unique passwords for every admin, 2FA on all of them, and remove dormant accounts. Force resets if a `302` success is suspected.
+
+```bash
+wp user update 1 --user_pass='<generated-strong-password>'
+wp user list --role=administrator --fields=user_login,user_email
+```
+
+3. **Reduce surface area**: disable XML-RPC if nothing needs it, restrict `/wp-admin` by IP where practical, and hide username enumeration.
+
+```apache
+<Files xmlrpc.php>
+  Require all denied
+</Files>
+```
+
+4. **Add application-level protection**: login limiting and 2FA plugins are useful as a second layer; do not rely on them alone under volume attacks.
+5. **Alert on the pattern**: a threshold of failed logins per hour, plus a new-admin-created alert. Silent attacks look like slow resource abuse.
+6. **Communicate**: if legitimate users were challenged or blocked, publish an explanation and widen allowlists.
+
+## Verification
+
+- Attack traffic no longer reaches PHP: the access log shows edge responses (403/429) instead of login POSTs.
+- CPU/resource usage is back to normal; no more host notices.
+- Legitimate users can log in normally, and admin accounts have unique passwords + 2FA enrolled.
+- No `302` successes from unexpected IP ranges after the incident window.
+
+## Root Cause
+
+WordPress login is a public endpoint that costs PHP to answer. Without edge rate limiting, an attack converts directly into resource exhaustion; without strong credentials and 2FA, some attempts eventually succeed.
+
+## Prevention
+
+- Ship rate limiting and XML-RPC policy as part of provisioning, not after the first incident.
+- Enforce 2FA for all administrators and audit accounts quarterly ([/checklists/security](/checklists/security)).
+- Monitor failed-login rate and resource usage together — the pairing predicts an incident before outages.
+- Keep logs at least 30 days for forensic follow-up.
+
+## Related Articles
+
+- [/security/malware-cleanup](/security/malware-cleanup)
+- [/security/file-permissions](/security/file-permissions)
+- [/errors/403-forbidden](/errors/403-forbidden)
+- [/checklists/security](/checklists/security)
+
+## Official References
+
+- [WordPress: Hardening](https://developer.wordpress.org/advanced-administration/security/hardening/)
+- [WordPress: Brute force attacks](https://wordpress.org/documentation/article/brute-force-attacks/)
+- [Cloudflare: Rate limiting rules](https://developers.cloudflare.com/waf/rate-limiting-rules/)

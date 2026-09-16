@@ -1,0 +1,129 @@
+---
+title: "Cart Empties / Session Lost at Checkout"
+description: "Items vanish between pages, checkout shows an empty cart, or the customer is logged out mid-order. The cause is almost always cookies, caching or object cache."
+difficulty: Intermediate
+timeToFix: "20–90 min"
+appliesTo: [WooCommerce, Caching, CDN, Hosting]
+tags: [woocommerce, session, cache, cookies, cloudflare]
+severity: High
+updated: 2025-12-27
+---
+
+## Symptoms
+
+- Adding to cart works, but the cart page or checkout shows "Your cart is currently empty".
+- Customer is logged out after Pay/returning from the gateway.
+- Cart merges or loses quantities when switching devices/browsers.
+- Happens for some users only, often on mobile with aggressive data savers, or behind CDNs.
+
+## Possible Causes
+
+1. Page cache (plugin or CDN) caching cart/checkout HTML, including nonces and fragments.
+2. Cookie domain mismatch: `www` vs non-`www`, or `siteurl` vs the actual host, causing duplicate cookies.
+3. Cookie expiry too short (`WC_SESSION_EXPIRY` / server session garbage collection).
+4. Object cache eviction: sessions stored in Redis/Memcached with `maxmemory` exhaustion, or a flush during checkout.
+5. Security plugins stripping/sanitising cookies, or a WAF blocking `wc-ajax`.
+6. Forced HTTPS mixed with an HTTP hostname (`secure` cookie flag) causing the session to be dropped.
+7. Table prefix or `wp_usermeta` session issues after migration.
+8. Reverse proxy caching `admin-ajax.php`/`wc-ajax` responses.
+
+## Prerequisites
+
+- Browser DevTools → Application → Cookies (read-only observation; never collect customer cookies in a ticket).
+- Cache plugin/CDN settings access.
+- Object cache info if Redis/Memcached is configured (see [/performance/object-cache](/performance/object-cache)).
+
+## Investigation
+
+1. **Reproduce the exact path**: logged-out user, private window, add to cart, reload, go to checkout.
+
+```bash
+curl -sS -c /tmp/c.txt -b /tmp/c.txt "https://example.com/?add-to-cart=15" -o /dev/null -w '%{http_code}\n'
+grep -E 'woocommerce_(session|items_in_cart|cart_hash)' /tmp/c.txt
+```
+
+2. **Inspect the response headers for caching of dynamic pages.**
+
+```bash
+curl -sSI https://example.com/cart/ | grep -iE 'cache-control|age|x-cache|cf-cache|set-cookie'
+curl -sSI https://example.com/checkout/ | grep -iE 'cache-control|cf-cache|age'
+```
+
+3. **Check cookie settings and hostname consistency.**
+
+```bash
+wp option get siteurl && wp option get home
+wp eval 'echo WC()->session->get_customer_id()."\n";' 2>/dev/null || true
+wp config get WP_CACHE
+```
+
+4. **Look for session storage health.**
+
+```bash
+redis-cli INFO memory | grep -E 'used_memory_human|maxmemory_human|evicted_keys'
+redis-cli --scan --pattern '*wc_session*' | head
+```
+
+5. **Check logs for session/cache interplay.**
+
+```bash
+grep -iE 'wc-ajax|admin-ajax|session|nonce' ~/logs/*access*.log | tail -20
+grep -iE 'woocommerce' wp-content/debug.log | tail -20
+```
+
+6. **Test with cache disabled** on staging to confirm the cache is the mechanism, not a symptom.
+
+## Diagnosis
+
+| Evidence | Cause | Fix |
+| --- | --- | --- |
+| Cart/checkout response has `Cache-Control: public`, no `Set-Cookie` | page cache | exclude those URLs |
+| `cf-cache-status: HIT` on `/checkout/` | CDN caching | bypass rule for these paths |
+| Cart works after login | cookie handling for guests | fix session cookies/hostname |
+| Sessions missing in Redis after a while | eviction | raise `maxmemory`, use a dedicated DB/prefix |
+| Only mobile/data-saver users | cookie blocking or long caching | rely on session cookies and avoid client caching of cart |
+| Fails only behind one ISP/proxy | cache/proxy | confirm with cache bypass, exclude AJAX |
+
+::: investigate
+Investigation mindset: a cart is *state*, and state must never be cached. If your first step is "clear the cache and see", you already have your hypothesis — now prove it with headers rather than hope.
+:::
+
+## Resolution
+
+1. **Exclude dynamic paths and cookies from caching**: `/cart`, `/checkout`, `/my-account`, `wc-ajax`, `admin-ajax`, and any request with `woocommerce_items_in_cart`, `woocommerce_cart_hash` or `wordpress_logged_in_*` cookies.
+2. **Normalise the hostname** so cookies are set for exactly one canonical domain, and make sure HTTPS is used consistently (secure cookies).
+3. **Fix session length** deliberately: document your `WC_SESSION_EXPIRY` expectation and align it with server session garbage collection where sessions are file-based.
+4. **Repair object cache**: increase memory, avoid flushing during business hours, and confirm the drop-in is compatible with the WooCommerce version (sessions have different behaviour with persistent caches).
+5. **Whitelist WooCommerce endpoints** in security plugins/WAF; AJAX calls must not be challenged.
+6. **Test the money path end to end** after any cache/security change, because checkout regressions are silent until a customer complains.
+
+## Verification
+
+- Cart persists across page loads, browser restarts (within expiry) and the redirect to/from the gateway in a sandbox.
+- Cart and checkout responses carry `no-cache`/`private` headers and no `cf-cache-status: HIT`.
+- A session created in one tab is visible in another; login state survives checkout return.
+- Redis shows sessions present with no evictions during a test hour (if used).
+
+## Root Cause
+
+Cart and session state travels through cookies and server-side storage. Any layer that caches HTML, rewrites cookies, or discards storage breaks that state — the failure surfaces as "the cart is empty".
+
+## Prevention
+
+- Ship cache exclusions and cookie rules as part of the WooCommerce deployment, not as a fix.
+- Add a scripted guest-checkout test to the release checklist ([/checklists/woocommerce](/checklists/woocommerce)).
+- Monitor eviction metrics on object caches during business hours.
+- Document one canonical hostname and enforce it in exactly one place.
+
+## Related Articles
+
+- [/woocommerce/checkout-broken](/woocommerce/checkout-broken)
+- [/performance/object-cache](/performance/object-cache)
+- [/decision-trees/checkout-failing](/decision-trees/checkout-failing)
+- [/errors/err-too-many-redirects](/errors/err-too-many-redirects)
+
+## Official References
+
+- [WooCommerce: Cart and session handling](https://woocommerce.com/document/cart-and-session-handling/)
+- [WooCommerce: Caching and cache plugins](https://woocommerce.com/document/configuring-caching-plugins/)
+- [Redis: memory management](https://redis.io/docs/latest/operate/oss_and_stack/management/optimization/memory-optimization/)

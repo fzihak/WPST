@@ -1,0 +1,155 @@
+---
+title: "Correct WordPress File Permissions"
+description: "644 for files, 755 for directories, 600 for wp-config.php — with the ownership rules, verification commands and the reason 777 is never the answer."
+difficulty: Beginner
+timeToFix: "15–45 min"
+appliesTo: [Hosting, Security, Filesystem, Apache, NGINX]
+tags: [security, permissions, hosting, ftp, malware]
+severity: High
+updated: 2025-12-04
+featured: true
+---
+
+## Symptoms
+
+- "Could not create directory", "Failed to write file", or plugin/theme installs asking for FTP credentials.
+- Media uploads fail with permission errors; cache or builder cannot write to `uploads`.
+- Security scanners report world-writable files or incorrect modes.
+- After a manual upload/restore, pages 500 or assets return 403.
+- Hosting support tells you to set 777, and the problem keeps coming back.
+
+## Possible Causes
+
+1. Mixed ownership: files uploaded by an FTP user but executed by the web user (or vice versa).
+2. A restore or extraction (as root) that set `root` ownership on WordPress files.
+3. Directories left at 644 or files at 755 — inverted modes break traversal and execution respectively.
+4. World-writable (`777`) modes from a shortcut fix, which security tooling flags and malware abuses.
+5. `wp-config.php` readable by the web process only by accident of group permissions.
+6. Umask differences between the deploy user and the web user.
+
+## Prerequisites
+
+- SSH or a panel with a permissions editor (some File Managers do this well).
+- Knowledge of the web user (often the account user on cPanel, `www-data` on VPS, `nginx`/`apache` elsewhere).
+- A backup: chmod/chown mistakes can be undone with `-R` commands, but a wrong owner on thousands of files is annoying to revert.
+
+## Investigation
+
+1. **Identify the users in play.**
+
+```bash
+id
+ps -eo user,cmd | grep -Ei 'php-fpm|apache|litespeed|nginx' | head -5
+ls -la wp-config.php index.php
+```
+
+2. **Find the anomalies** rather than fixing "everything".
+
+```bash
+find . -type f -perm -o+w | head            # world-writable files
+find . -type d -perm -o+w | head            # world-writable dirs
+find . -not -user accountuser | head -20    # files not owned by the account user
+ls -ld . wp-content wp-content/uploads backups
+```
+
+3. **Confirm the required modes for WordPress.**
+
+| Path | Mode | Notes |
+| --- | --- | --- |
+| Directories | 755 | readable + traversable |
+| Files | 644 | readable, owner-writable |
+| `wp-config.php` | 600 | secrets never world-readable |
+| `uploads/` | 755 (dirs) / 644 (files) | writable by the web user via ownership, not mode |
+| `.htaccess` | 644 | must stay readable by the server |
+| `object-cache.php`, drop-ins | 644 | written by plugins, not by hand |
+
+4. **Verify the web user can write where it must** — ownership is what matters, not extra mode bits.
+
+```bash
+sudo -u www-data touch wp-content/uploads/probe && rm wp-content/uploads/probe && echo "uploads writable"
+sudo -u www-data wp plugin install hello-dolly --dry-run 2>&1 | tail -3
+```
+
+5. **Check for a restrictive umask or FPM setting** if new files keep appearing with wrong modes.
+
+```bash
+umask
+grep -Ri 'umask' /etc/php/*/fpm/pool.d/ 2>/dev/null
+```
+
+## Diagnosis
+
+| Finding | Cause | Fix |
+| --- | --- | --- |
+| Files owned by `root` | extraction/restore as root | `chown -R account:group .` |
+| `777` everywhere | a past shortcut | set 755/644 deliberately |
+| Cannot write but modes look right | wrong owner | fix ownership |
+| `wp-config.php` mode 644 | default install | `chmod 600` |
+| Installs ask for FTP | FS_METHOD or ownership | set ownership; optionally `FS_METHOD direct` |
+| Directory mode 644 | inverted restore | `find -type d -exec chmod 755` |
+| `.user.ini` world-writable | manual upload | 644 and owner-owned |
+
+::: investigate
+Investigation mindset: permissions are two questions — *who owns the file* and *which bits are set*. Fix ownership first: it solves most write failures without granting dangerous modes.
+:::
+
+## Resolution
+
+1. **Normalise modes** without breaking the WordPress markers:
+
+```bash
+find . -type d -exec chmod 755 {} \;
+find . -type f -exec chmod 644 {} \;
+chmod 600 wp-config.php
+chmod 644 .htaccess .user.ini 2>/dev/null
+```
+
+2. **Fix ownership** to the account/web user (adjust to your environment):
+
+```bash
+# shared hosting / cPanel
+chown -R accountuser:accountusergroup ~/public_html
+# dedicated server with FPM as www-data
+chown -R www-data:www-data /var/www/site
+```
+
+3. **Grant writes via ownership, not modes.** If a plugin genuinely needs to write, ensure the web user owns that directory (or the group includes it) — never `chmod 777`.
+4. **Allow direct installs deliberately** if the host requires it:
+
+```php
+define( 'FS_METHOD', 'direct' );
+```
+
+5. **Re-scan for anomalies** until the find commands return nothing.
+6. **Rotate credentials** if you found world-writable files alongside suspicious code — that combination is an infection pattern ([malware cleanup](/security/malware-cleanup)).
+
+## Verification
+
+- `find . -type f -perm -o+w` and the directory variant return no results.
+- `wp-config.php` is 600 and not fetchable over HTTP.
+- Plugin/theme installs, media uploads and cache writes work without FTP prompts.
+- Frontend, admin and REST all return expected status codes (no 403 regressions from over-tight modes).
+
+## Root Cause
+
+WordPress separates code (not writable at runtime in a hardened setup) from data (uploads, cache). Failing to distinguish ownership from mode bits is the root of nearly every "permissions" ticket.
+
+## Prevention
+
+- Set ownership/modes during provisioning and verify as the web user.
+- Include the anomaly scans in the security checklist ([/checklists/security](/checklists/security)).
+- Never document 777 as a fix; document owner + 755/644 instead.
+- Ensure deploy tooling runs as the correct user with a sane umask.
+
+## Related Articles
+
+- [/errors/403-forbidden](/errors/403-forbidden)
+- [/security/malware-cleanup](/security/malware-cleanup)
+- [/hosting/cpanel](/hosting/cpanel)
+- [/checklists/security](/checklists/security)
+
+## Official References
+
+- [WordPress: File permissions](https://developer.wordpress.org/advanced-administration/server/file-permissions/)
+- [WordPress: Hardening](https://developer.wordpress.org/advanced-administration/security/hardening/)
+- [Apache: Directory permissions](https://httpd.apache.org/docs/2.4/misc/security_tips.html)

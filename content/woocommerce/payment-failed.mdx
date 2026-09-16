@@ -1,0 +1,128 @@
+---
+title: "Payment Failed / Order Not Paid"
+description: "Reconcile charges and orders, read the gateway logs correctly, test the webhook path, and never ask a customer for card data."
+difficulty: Advanced
+timeToFix: "30–120 min"
+appliesTo: [WooCommerce, Payment Gateways, Hosting, WAF]
+tags: [woocommerce, payment, gateway, logs, webhook]
+severity: Critical
+updated: 2026-01-18
+featured: true
+---
+
+## Symptoms
+
+- Order status is `failed` or stuck in `pending payment` while the customer believes payment succeeded.
+- Checkout returns to the site with "Payment failed" or an empty error.
+- Gateway dashboard shows declined transactions or charges without matching orders.
+- Intermittent: some payments succeed, most fail during peak hours.
+- Redirect-based methods (PayPal, iDEAL, 3DS) redirect back but the order never updates.
+
+## Possible Causes
+
+1. Webhook/callback not delivered or rejected (WAF, basic auth, redirect on the callback URL, wrong secret).
+2. Credentials/mode mismatch: sandbox keys in live mode, expired API keys, currency not enabled on the account.
+3. Total mismatch between cart and gateway amount (currency switcher, rounding, taxes recalculated).
+4. Gateway account limits (holds, verification, statement descriptor changes).
+5. HPOS incompatibility in the payment plugin, so the order record never transitions.
+6. Checkout nonce/order-id lost because the cart/checkout page is cached.
+7. Outbound HTTPS from the server blocked or failing TLS, so order creation calls fail.
+
+## Prerequisites
+
+- Order IDs, amounts, timestamps and gateway names for affected orders.
+- WooCommerce System Status Report.
+- Access to WooCommerce → Status → Logs and the gateway's own dashboard.
+- A staging copy with the gateway in test mode.
+
+## Investigation
+
+1. **Reproduce in test mode** first: is the code path broken, or the account?
+
+```bash
+wp wc order list --status=failed --fields=id,date_created,total,payment_method --user=1
+wp wc order get 1234 --user=1 --format=json | head -c 800
+```
+
+2. **Read the gateway log and order notes together**, aligning timestamps.
+
+```bash
+wp option get woocommerce_gateway_order_stripe --format=json | head -c 400   # settings sanity check
+tail -n 200 wp-content/uploads/wc-logs/*.log | grep -iE 'error|declined|401|403|invalid'
+```
+
+3. **Prove the webhook path from the public internet.**
+
+```bash
+curl -sSI https://example.com/?wc-api=WC_Gateway_Stripe | head -5
+curl -sS -X POST https://example.com/wp-json/wc/v3/orders -H 'Content-Type: application/json' -o /dev/null -w '%{http_code}\n'
+```
+
+4. **Check for interference**: security plugins, WAF rules, basic auth, and redirects on API callback URLs.
+
+| Rule/feature | Effect on payments |
+| --- | --- |
+| WAF blocking POST to `?wc-api=` | charge OK, order stays unpaid |
+| Cloudflare "Under Attack Mode" | intermittent failures under load |
+| Basic auth on staging | all webhooks fail (403) |
+| Forced redirect http→https on the callback | gateway cannot follow POST redirects |
+| Cached checkout page | nonce/order mismatch on return |
+
+5. **Verify amounts and currency** for a failing order: compare the gateway transaction amount with the WooCommerce order total.
+
+6. **Check server-side outbound requests** used to create/capture payments, with TLS and DNS in mind ([ssl handshake](/errors/ssl-handshake-failed)).
+
+## Diagnosis
+
+| Evidence | Cause | Action |
+| --- | --- | --- |
+| Gateway API 401/403 in the log | keys/mode/account | fix credentials, re-test live small order |
+| Order notes: "webhook signature could not be verified" | secret mismatch | re-copy the webhook secret |
+| Charge exists, order failed | callback path blocked | fix WAF/auth/redirect, then reconcile orders |
+| Decline code from gateway (e.g. `insufficient_funds`) | customer/bank side | explain, adjust retry policy |
+| Only peak-hour failures | timeouts/limits | raise `max_execution_time`, add gateway timeouts |
+| Total mismatch | tax/shipping recalculation | fix calculation source of truth |
+
+::: investigate
+Investigation mindset: separated evidence beats guessing. There are exactly two timelines to compare — the gateway's and WooCommerce's — and the webhook is the bridge between them. Almost every "failed payment" is a broken bridge, not a broken charge.
+:::
+
+## Resolution
+
+1. **Reconcile first** (money is real): for each affected order, check the gateway, then mark the order as processing if charged, or refund duplicate charges. Add an order note documenting the manual reconciliation.
+2. **Fix the callback path**: whitelist the gateway endpoints (IPs and paths), disable basic auth for callback routes, and never redirect on `?wc-api=` requests.
+3. **Correct credentials/mode** and place one real low-value live order with a known card to confirm end to end.
+4. **Fix totals**: choose a single recalculation point (WooCommerce), disable plugins that change totals after display, ensure the gateway receives the post-recalculation amount.
+5. **Fix HPOS compatibility**: update the payment plugin, or keep order storage in compatibility mode with a documented plan.
+6. **Handle timeouts**: set explicit gateway timeouts, retry with backoff, and queue order fulfilment rather than blocking the customer's checkout request.
+
+## Verification
+
+- Five consecutive test orders (test mode) succeed and transition `pending → processing`.
+- One live micro-payment succeeds and its webhook arrives (visible in gateway dashboard and order notes).
+- Failed-order count per hour returns to baseline; add an alert on it.
+- No 4xx/5xx on callback routes in the access log for a full day.
+
+## Root Cause
+
+Payments fail for one of three reasons: the gateway rejected the request, the gateway accepted it but WordPress never learned about it, or the request never reached the gateway. Each has a different home in the logs.
+
+## Prevention
+
+- Monitor: failed orders per hour, webhook 4xx/5xx rate, and gateway API error rate.
+- Keep a secondary gateway configured so a single provider outage does not stop revenue.
+- Test the full money path after every WooCommerce/plugin update on staging, with a scripted card set.
+- Never store or request card data in tickets — use gateway references only.
+
+## Related Articles
+
+- [/runbooks/payment-failure](/runbooks/payment-failure)
+- [/woocommerce/checkout-broken](/woocommerce/checkout-broken)
+- [/woocommerce/order-emails-not-sending](/woocommerce/order-emails-not-sending)
+- [/checklists/woocommerce](/checklists/woocommerce)
+
+## Official References
+
+- [WooCommerce: Troubleshooting payment gateways](https://woocommerce.com/document/troubleshooting-payment-gateways/)
+- [WooCommerce: Webhooks](https://woocommerce.com/document/webhooks/)
+- [WooCommerce: System Status Report](https://woocommerce.com/document/understanding-the-woocommerce-system-status-report/)

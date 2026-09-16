@@ -1,0 +1,127 @@
+---
+title: "Site Loads But the Layout Is Broken"
+description: "Unstyled pages, overlapping sections, missing fonts and images. Separate asset delivery, cache, CSS conflicts and template changes in a repeatable order."
+difficulty: Beginner
+timeToFix: "15–45 min"
+appliesTo: [Themes, Plugins, Elementor, Caching]
+tags: [theme, css, cache, elementor, frontend]
+severity: Medium
+updated: 2026-01-02
+featured: true
+---
+
+## Symptoms
+
+- Page renders as plain HTML: no styles at all, blue links, serif text.
+- Partially styled: header fine, sections stacked incorrectly, fonts missing.
+- Only some pages/templates affected; the admin looks correct.
+- Users on mobile see it differently from desktop; some browsers look fine, one does not.
+
+## Possible Causes
+
+1. The main stylesheet is not enqueued (conditional enqueue failing, or an optimisation plugin dropping it).
+2. Asset 404s: file removed, wrong path, case sensitivity on Linux, or a plugin that rewrote URLs.
+3. Stale cache: page cache, CDN, browser, or OPcache serving pre-deploy HTML/CSS.
+4. A builder's generated CSS is missing (Elementor's `uploads/elementor/css` not writable or deleted).
+5. CSS conflicts: another stylesheet injected later with higher specificity.
+6. Theme switched or child theme edited incorrectly; `style.css` header missing or with a different name.
+7. JS error aborting early, so layout scripts never initialise (sliders, sticky headers, tabs).
+
+## Prerequisites
+
+- Browser DevTools (Network + Console) — this ticket is solved there, not in the dashboard.
+- A second browser profile or private window to exclude client-side cache.
+- Knowledge of what changed: deploy, plugin update, theme edit, cache plugin change.
+
+## Investigation
+
+1. **Reproduce cleanly** — private window, DevTools → Network → "Disable cache".
+
+```bash
+curl -sSI https://example.com/ | grep -iE 'cache|server'
+curl -sS https://example.com/ | grep -oE '<link[^>]+stylesheet[^>]*>' | head
+```
+
+2. **Look at the Network panel for the theme's main CSS** and note the status code.
+
+```bash
+curl -sS -o /dev/null -w '%{http_code} %{content_type} %{size_download}\n' \
+  https://example.com/wp-content/themes/active-theme/style.css
+```
+
+3. **Get the real file list from the theme** — enqueue order and handles tell you what should load.
+
+```bash
+grep -rn "wp_enqueue_style\|wp_enqueue_script" wp-content/themes/active-theme/functions.php | head -20
+ls -la wp-content/themes/active-theme/assets/ 2>/dev/null
+```
+
+4. **Check cache layers** because a cached broken page looks identical to a broken site.
+
+```bash
+curl -sSI -H 'Cache-Control: no-cache' "https://example.com/?nocache=$(date +%s)" | grep -iE 'x-cache|cf-cache|age'
+wp cache flush
+```
+
+5. **Test with optimisations and security layers off** (on staging) to catch "one stylesheet dropped" behaviours.
+
+```bash
+wp plugin list --status=active --field=name | grep -Ei 'cache|minif|autoptim|perfmatters|rocket'
+```
+
+6. **Check for a JS abort** in the console: one uncaught error early in a bundled file can stop all layout scripts.
+
+## Diagnosis
+
+| Evidence | Cause | Fix layer |
+| --- | --- | --- |
+| Stylesheet request missing entirely | not enqueued / optimiser drop | theme or caching plugin |
+| Stylesheet 404 | file/path missing | restore file from the theme package |
+| Stylesheet 200 but rules absent | wrong file/folder, case mismatch | correct the enqueue path |
+| Fixed after purge only | cache | cache policy + purge on deploy |
+| Only builder pages broken | generated CSS | regenerate CSS, fix permissions |
+| Works in one browser | browser cache / CSS support | hard reload, check feature usage |
+
+::: investigate
+Investigation mindset: "broken layout" is a delivery question. Answer three things — is the correct stylesheet requested, does it return 200 with content, and does the served HTML reference the right file? Almost every case lands on one of those.
+:::
+
+## Resolution
+
+1. Fix the enqueue: correct the handle/path, use `get_stylesheet_directory_uri()`, and remove conditionals that exclude the failing template.
+2. Restore missing assets from the theme package (matching version), then re-run any build step (SCSS/npm) if the theme ships compiled CSS.
+3. Regenerate builder CSS data and confirm `wp-content/uploads/elementor/css` (or equivalent) is writable by the web user.
+4. Purge correctly and consistently: page cache → object cache → CDN → OPcache; then verify with a cache-buster.
+5. Resolve CSS conflicts by identifying the winning rule in DevTools (which file/selector) and scoping or moving the override into the child theme.
+6. Fix JS errors: load your scripts with `defer`, guard for missing jQuery, and never depend on inline handlers that a plugin rewrote.
+
+## Verification
+
+- Compare rendered HTML/CSS against staging: same stylesheets, same order, same content length.
+- Visual check on desktop + mobile widths, and one non-Chrome browser.
+- Lighthouse/PageSpeed reports no failed requests.
+- Purge and re-check: the layout must survive a cache purge (that is the deploy reality).
+
+## Root Cause
+
+Themes are CSS/JS delivered through the WordPress asset queue, then through cache layers. Breakage comes from the queue (missing asset), the transport (cache/404), or the CSS cascade (another layer winning).
+
+## Prevention
+
+- Never edit cached/generated CSS by hand; treat build output as disposable.
+- Automate "purge all caches after deploy" so stale asset behaviour cannot be the first ticket.
+- Keep a child theme for all customisations so parent theme updates are safe.
+- Add a visual regression check (or at least a manual two-page smoke test) to the release checklist.
+
+## Related Articles
+
+- [/elementor/css-not-loading](/elementor/css-not-loading)
+- [/performance/ttfb](/performance/ttfb)
+- [/plugins/plugin-conflict](/plugins/plugin-conflict)
+- [/checklists/pre-launch](/checklists/pre-launch)
+
+## Official References
+
+- [Theme Handbook: Including assets](https://developer.wordpress.org/themes/advanced-topics/child-themes/)
+- [Elementor: Regenerate CSS](https://elementor.com/help/regenerate-css-data/)
+- [MDN: CSS cascade and specificity](https://developer.mozilla.org/en-US/docs/Web/CSS/Specificity)

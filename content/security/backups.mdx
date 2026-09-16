@@ -1,0 +1,131 @@
+---
+title: "Backups You Can Actually Restore"
+description: "A backup you have never restored is a hypothesis. How to structure files+database backups, test restores, and define RPO/RTO in plain support language."
+difficulty: Intermediate
+timeToFix: "30–90 min (setup)"
+appliesTo: [Security, Hosting, Migration]
+tags: [security, backup, hosting, recovery, database]
+severity: High
+updated: 2025-11-30
+---
+
+## Symptoms
+
+- A restore attempt fails: archive corrupted, database dump incomplete, or the plugin cannot find files.
+- Backups exist but nobody knows the last successful restore date.
+- Host "daily backups" turn out to be 24 hours old at best and stored on the same disk that failed.
+- During an incident, the restore takes longer than the customer's tolerance — discovered the hard way.
+
+## Possible Causes
+
+1. Backups include files but not the database (or vice versa) — the two must be consistent.
+2. Archives created while the database was writing, so the dump and files disagree.
+3. Storage on the same server/disk as the site; a host failure takes both.
+4. No automation: manual backups happen until the first busy week.
+5. No retention policy: the only copy is overwritten by a broken state.
+6. Plugins backing up only `wp-content` and not `wp-config.php`, cron jobs, or mail configuration.
+7. Encryption keys or restore credentials lost, making archives unusable.
+
+## Prerequisites
+
+- Access to choose/verify a backup tool (plugin, host feature, or your own script).
+- Offsite storage: object storage, a second host, or a vendor that stores externally.
+- A scratch environment (subdomain or local) for restore tests.
+
+## Investigation
+
+1. **Inventory what actually exists today.**
+
+```bash
+ls -lah ~/backups ~/public_html/wp-content/upgrade 2>/dev/null
+find / -maxdepth 4 -name '*.sql.gz' -mtime -7 2>/dev/null | head
+```
+
+2. **Check the logging from the backup tool and hosting feature** for the last successful run, size and duration — not just "scheduled".
+
+3. **Verify archive integrity before you need it.**
+
+```bash
+tar -tzf backup-files-latest.tar.gz | head            # lists without extracting
+gzip -t backup-db-latest.sql.gz && echo "dump intact"
+```
+
+4. **Check consistency**: does the pair (files + DB) belong to the same point in time?
+
+```bash
+ls -l --time-style=long-iso backup-files-latest.tar.gz backup-db-latest.sql.gz
+```
+
+5. **Test a restore in a scratch location** — this is the only real verification.
+
+```bash
+# database into a scratch DB
+mysql -u user -p scratch_db < backup-db-latest.sql
+wp core version --path=/var/www/scratch
+```
+
+6. **Define your numbers and check you meet them**: RPO (how much data may be lost) and RTO (how long a restore may take).
+
+## Diagnosis
+
+| Finding | Risk | Fix |
+| --- | --- | --- |
+| Only file backups | content/database loss | add DB dumps on the same schedule |
+| Only DB backups | code/config loss | add files (or manage code in Git) |
+| Backups on the same disk | total loss on host failure | copy offsite |
+| Last success older than RPO | silent gap | fix the scheduler, alert on failures |
+| Restore untested | unknown RTO | schedule restore drills |
+| Archive cannot be listed | corruption | raise retention, use checksums |
+| No retention beyond latest | one bad copy | keep 7 daily + 4 weekly + 3 monthly |
+
+::: investigate
+Investigation mindset: a backup process has three verifiable properties — existence, consistency and restorability. Only the third matters when you are on a call with an angry customer. Prove it on a calendar, not in an emergency.
+:::
+
+## Resolution
+
+1. **Choose a layered strategy**:
+
+| Layer | Frequency | Retention | Purpose |
+| --- | --- | --- | --- |
+| Host snapshots/backups | daily | 7–30 days | fast whole-environment restore |
+| Plugin/script backup offsite | daily (DB), weekly (files) | 7–30 days | portable restore, migration |
+| Pre-change manual snapshot | every risky operation | until verified | rollback proof for the ticket |
+| Git repository for code | every commit | forever | code history, review, rollback |
+
+2. **Take a snapshot before every risky change** (updates, migrations, malware work, DNS cutover) and verify it opens.
+3. **Automate and alert**: schedule, then alarm on failure or on archives that are suspiciously small.
+4. **Store offsite** with versioning, so an infection or a bad deploy does not propagate into your only copy.
+5. **Document the restore procedure** including paths, commands and who has credentials — then run a drill and record the actual RTO.
+6. **Encrypt archives** and store keys where the restore team can reach them (a vault, not the same disk).
+
+## Verification
+
+- Restore drill completed within the target RTO, documented with dates and durations.
+- Backups appear offsite, are listable, and contain both files and a database dump from the same window.
+- Alerts fire when a backup fails (test by forcing a failure).
+- Database dump restores cleanly into scratch with `wp db check` passing.
+
+## Root Cause
+
+Backups fail as a *process*, not as a tool: schedules stop silently, storage shares the failure domain, and restores are never rehearsed. Most of the work is verification, not configuration.
+
+## Prevention
+
+- Monitor backup success as a first-class alert; "no backup in 30 hours" is a P2.
+- Include backups in every pre-launch and migration checklist.
+- Keep a Git-based record of code so restores are smaller and faster.
+- Re-test quarterly; rotate credentials used by the backup tool.
+
+## Related Articles
+
+- [/security/malware-cleanup](/security/malware-cleanup)
+- [/migration/migrate-wordpress-site](/migration/migrate-wordpress-site)
+- [/checklists/incident-response](/checklists/incident-response)
+- [/mysql/database-repair](/mysql/database-repair)
+
+## Official References
+
+- [WordPress: Backups](https://wordpress.org/documentation/article/wordpress-backups/)
+- [WP-CLI: db export](https://developer.wordpress.org/cli/commands/db/export/)
+- [WordPress: Restoring your site](https://wordpress.org/documentation/article/restoring-your-database-from-backup/)

@@ -1,0 +1,131 @@
+---
+title: "Git Workflow for WordPress Support Teams"
+description: "Version-controlled WordPress: what belongs in the repository, how to deploy safely, and how Git turns 'what changed?' into a five-second answer."
+difficulty: Intermediate
+timeToFix: "1–3 hours (setup)"
+appliesTo: [Deployment, Git, Hosting, CI]
+tags: [deployment, git, hosting, process, update]
+severity: Medium
+updated: 2025-11-26
+---
+
+## Symptoms
+
+- You cannot answer "what changed in the last 24 hours?" for a broken site.
+- Fixes are applied directly on production with no review and no history.
+- A hotfix breaks another site because the change is invisible.
+- Deploys are performed with manual file copies, so rollback means guessing.
+
+## Possible Causes
+
+1. No version control: files edited live over FTP or a panel editor.
+2. Mixed repository: uploads, caches and secrets committed alongside code.
+3. No branching model, so experiments are committed straight to `main`.
+4. Deployment without posts-deploy cache clears, so the code is live but not active.
+
+## Prerequisites
+
+- Git host access (GitHub/GitLab) with a repository per site or per theme/plugin.
+- Decided scope: usually `wp-content/themes/<custom>`, `wp-content/plugins/<custom>`, `mu-plugins`, plus a config template.
+- A deployment path: SFTP/rsync script, host Git integration, or CI.
+
+## Investigation
+
+1. **Decide what is tracked** — this is the single most important decision.
+
+| Path | Tracked? | Reason |
+| --- | --- | --- |
+| Custom theme / child theme | yes | code you own |
+| Custom plugins & mu-plugins | yes | code you own |
+| Third-party plugins | vendor, pin versions in a manifest | avoid re-publishing others' code |
+| `wp-config.php` | template only (`wp-config-sample`) | contains secrets |
+| `uploads/`, caches, backups, logs | no | user data and churn |
+| `.htaccess`, `.user.ini`, php.ini snippets | yes, as templates | server config as code |
+
+2. **Check the current repository hygiene** (or set up the `.gitignore`).
+
+```bash
+cat .gitignore
+git status --short | head -20
+git check-ignore -v wp-config.php wp-content/uploads/cache
+```
+
+3. **Establish the branch/flow model**: `main` = production, short-lived branches per ticket, PR with a reviewer, deploy on merge.
+4. **Wire deploy-time cache expectations**: after every deploy, PHP OPcache, page cache, object cache and CDN caches must be cleared or invalidated ([/php/opcache](/php/opcache)).
+
+## Diagnosis
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| "It works locally, not on the server" | untracked config | track config templates; document per-env settings |
+| Secrets in the repo | config committed | rotate secrets, add to `.gitignore`, use env vars |
+| Huge repository, slow clones | uploads/backups committed | clean history, add `.gitignore` |
+| Change not live after deploy | caches not purged | add purge steps to deploy |
+| Broken deploy, no rollback | no tagged releases | tag releases, deploy by tag/SHA |
+
+::: investigate
+Investigation mindset: during an incident, Git answers the highest-value question in support — *what changed?* A repository is not hygiene; it is an incident-response tool.
+:::
+
+## Resolution
+
+1. **Create the repository with a minimal tracking set** and a `.gitignore` that excludes user data and secrets:
+
+```bash
+cat >> .gitignore <<'EOF'
+wp-config.php
+wp-content/uploads/
+wp-content/cache/
+wp-content/upgrade/
+*.log
+*.sql
+.env
+EOF
+```
+
+2. **Commit server config as templates** (`htaccess.txt`, `.user.ini.example`) so any environment can be rebuilt predictably.
+3. **Adopt a small workflow**:
+   - branch per ticket (`fix/checkout-500`)
+   - PR with the reproduction and evidence in the description
+   - review by a second engineer
+   - squash-merge into `main`, tag a release for production
+4. **Deploy deterministically**: `git archive` + rsync, or the host's Git feature, never hand-copied files.
+
+```bash
+git archive --format=tar HEAD | ssh host 'tar -x -C ~/public_html'
+ssh host 'cd ~/public_html && wp cache flush && wp rewrite flush'
+```
+
+5. **Automate the boring checks** in CI: PHP lint, content lint for the KB, and a smoke test of key URLs after deploy.
+6. **Always have a rollback**: deploy by tag, keep the previous release, and document the one-command revert (`git revert <sha>` or re-deploy previous tag).
+
+## Verification
+
+- `git status` is clean after a deploy (no stray local files on the server).
+- A deliberate revert deploy returns the site to the previous behaviour within minutes.
+- Post-deploy caches are purged automatically; changes are live without manual intervention.
+- The repository contains no secrets and no user uploads (verified by scanning history).
+
+## Root Cause
+
+Support work is change management. Without a source of truth for code and a repeatable deploy, every incident starts with archaeology instead of diagnosis.
+
+## Prevention
+
+- Enforce branch protection and reviews — even for one-person teams (future you is the reviewer).
+- Tag releases and keep a deploy log per site.
+- Rotate any secret that ever touched a repository, then keep secrets out with environment variables.
+- Run a quarterly repository audit (size, secrets, ignored paths).
+
+## Related Articles
+
+- [/migration/migrate-wordpress-site](/migration/migrate-wordpress-site)
+- [/php/opcache](/php/opcache)
+- [/wordpress/update-failed](/wordpress/update-failed)
+- [/contribute](/contribute)
+
+## Official References
+
+- [WordPress: Version control](https://developer.wordpress.org/advanced-administration/debug/version-control/)
+- [Git: gitignore](https://git-scm.com/docs/gitignore)
+- [WordPress: Hardening (secrets & salts)](https://developer.wordpress.org/advanced-administration/security/hardening/)

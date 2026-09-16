@@ -1,0 +1,133 @@
+---
+title: "Order Emails Not Sending"
+description: "Customers never receive confirmations. Separate SMTP misconfiguration from deliverability, template errors and cron backlog — and prove delivery, not just 'sent'."
+difficulty: Intermediate
+timeToFix: "20–60 min"
+appliesTo: [WooCommerce, SMTP, Hosting, Email]
+tags: [woocommerce, email, smtp, deliverability, cron]
+severity: High
+updated: 2025-12-28
+featured: true
+---
+
+## Symptoms
+
+- Orders are created but customers and admins receive no confirmation email.
+- Some recipients get mail, others do not (often Gmail/Outlook only).
+- Emails arrive hours late, or land in spam.
+- Password reset and other WordPress emails also never arrive.
+
+## Possible Causes
+
+1. `mail()` used directly without SMTP: accepted locally, rejected or filtered remotely.
+2. SMTP credentials wrong/expired (API key rotated, 2FA enabled, sending domain unverified).
+3. SPF/DKIM/DMARC not aligned → spam filtering or outright rejection.
+4. Two SMTP plugins active, so both send (or both silently fail).
+5. Crypto: port 465 (implicit TLS) used without SSL, or port 25 blocked by the host.
+6. Emails disabled in WooCommerce → Settings → Emails, or recipients overridden per-product/vendor.
+7. Cron backlog delaying queued messages (Action Scheduler / a queue plugin).
+8. Template fatal: a custom email template or hook throws during send.
+
+## Prerequisites
+
+- Access to an email log (most SMTP plugins provide one) or the provider's outbound log.
+- A real inbox you control (prefer Gmail + Outlook) for delivery tests.
+- The WooCommerce System Status Report for versions and mailer details.
+
+## Investigation
+
+1. **Test WordPress mail itself** (password reset) to separate "WordPress cannot send" from "WooCommerce config".
+
+```bash
+wp eval 'wp_mail( "you@example.com", "WSL mail test", "body" ) ? print("queued\n") : print("failed\n");'
+```
+
+2. **Read the email log, not the order notes.** "Sent" in WooCommerce means "handed to the mailer".
+
+```bash
+ls -la wp-content/uploads/wc-logs/ | tail -5
+grep -iE 'error|fail|refus|auth|denied' ~/logs/*mail* 2>/dev/null | tail -20
+```
+
+3. **Verify SMTP connectivity from the server itself** to eliminate host blocking.
+
+```bash
+openssl s_client -connect smtp.provider.com:587 -starttls smtp -quiet <<< "QUIT" 2>&1 | head -12
+# 465 alternative:
+openssl s_client -connect smtp.provider.com:465 -quiet <<< "QUIT" 2>&1 | head -6
+```
+
+4. **Check authentication config without exposing secrets.**
+
+```bash
+wp plugin list --status=active --fields=name,status | grep -iE 'smtp|mail|post'
+wp option get woocommerce_cod_settings 2>/dev/null >/dev/null; wp option get admin_email
+```
+
+5. **Confirm WooCommerce email settings and recipients.**
+
+```bash
+wp option get woocommerce_customer_processing_order_settings --format=json | head -c 400
+wp option get woocommerce_new_order_settings --format=json | head -c 400
+```
+
+6. **Check the queue and cron** if the site uses transactional queueing or Action Scheduler ([cron article](/wordpress/cron-not-running)).
+
+7. **Test deliverability**: send to Gmail, inspect raw headers for `SPF`, `DKIM`, `DMARC` results and spam score.
+
+## Diagnosis
+
+| Evidence | Cause | Fix |
+| --- | --- | --- |
+| No log entry at all | emails not triggered (settings/status) | check WooCommerce email settings & hooks |
+| Log: auth failure / 535 | credentials | fix SMTP creds or API key |
+| Log: connection refused / timeout | port blocked, TLS mode wrong | try 587+STARTTLS or 465+SSL |
+| Log: sent; inbox empty | deliverability | SPF/DKIM/DMARC, reputation, suppression list |
+| Only some domains affected | filtering | authenticate, avoid link shorteners, add plain-text part |
+| Emails hours late | queue/cron backlog | drain queue, fix cron |
+| Broken template in log | custom template fatal | revert template to default, re-apply styling |
+
+::: investigate
+Investigation mindset: "sent" is a hand-off, not a delivery. Track the message across four stages — trigger, mailer, provider acceptance, recipient inbox — and you will always find which stage drops it.
+:::
+
+## Resolution
+
+1. **Switch to authenticated sending** (SMTP or a transactional API) and configure the plugin exactly once; deactivate competing mailers.
+2. **Align DNS**: SPF record including the provider, DKIM signing enabled, DMARC policy at least `p=none` with reporting, and a `From` address on the site's own domain.
+3. **Fix ports/TLS** to what the provider documents (587+STARTTLS is the safest default, 465 with SSL as fallback).
+4. **Re-enable email types** in WooCommerce → Settings → Emails and clear per-order/per-product overrides that prevent sending.
+5. **Drain the queue** and confirm cron health; for heavy stores, use a transactional API that queues server-side.
+6. **Repair custom templates**: if a child theme overrides WooCommerce email templates, re-copy the current default template and re-apply styling changes.
+7. **Test in a real inbox** for Gmail, Outlook and one corporate domain; open the raw message and confirm authentication results.
+
+## Verification
+
+- A test order produces: customer processing email, admin new-order email — both received and authenticated.
+- Password reset emails arrive in a real inbox (not spam).
+- Provider dashboard shows delivered events for those message IDs.
+- SPF/DKIM/DMARC checks pass for the sending domain.
+
+## Root Cause
+
+Email has four stages and each has its own failure mode. Most support time is wasted because teams stop at stage two ("the plugin says sent").
+
+## Prevention
+
+- Configure SMTP/transactional email at build time, never after launch (it is on the pre-launch checklist).
+- Monitor bounces/complaints in the provider dashboard and keep a suppression-list review task.
+- Keep only one mailer; document which one.
+- Add an end-to-end email test to the WooCommerce quarterly checklist.
+
+## Related Articles
+
+- [/wordpress/cron-not-running](/wordpress/cron-not-running)
+- [/woocommerce/payment-failed](/woocommerce/payment-failed)
+- [/decision-trees/email-not-sending](/decision-trees/email-not-sending)
+- [/checklists/woocommerce](/checklists/woocommerce)
+
+## Official References
+
+- [WooCommerce: Email settings](https://woocommerce.com/document/configuring-woocommerce-settings/)
+- [WordPress: wp_mail()](https://developer.wordpress.org/reference/functions/wp_mail/)
+- [WP-CLI: wp eval](https://developer.wordpress.org/cli/commands/eval/)

@@ -1,0 +1,126 @@
+---
+title: "Tutor LMS: Course Progress Not Saving"
+description: "Lesson complete buttons do nothing, progress resets, or quizzes never submit. Diagnose AJAX, cron, caching and enrolment state in LMS stacks."
+difficulty: Intermediate
+timeToFix: "30–90 min"
+appliesTo: [Tutor LMS, LearnDash, LifterLMS, Hosting]
+tags: [lms, tutor-lms, ajax, cache, cron]
+severity: High
+updated: 2025-12-24
+---
+
+## Symptoms
+
+- "Complete lesson" appears to work, but progress stays 0% after reload.
+- Progress resets to zero for all students after a cache purge or deploy.
+- Quiz answers submit but the result never appears; "Continue" loops.
+- Certificates never unlock even though lessons show as complete.
+- Only some students affected — commonly those behind a CDN or on mobile.
+
+## Possible Causes
+
+1. AJAX requests blocked by a security plugin/WAF, or failing because of a stale nonce on a cached page.
+2. Course pages cached for logged-in users, so progress markers revert to the cached state.
+3. Database writes failing silently: MySQL read-only, disk full, or a table lock.
+4. Cron/queue backlog preventing deferred jobs (results processing, certificate generation, completion emails).
+5. Custom role/capability changes breaking the LMS permission to write progress.
+6. Conflict with another plugin hooking the same completion action (gamification, analytics, reports).
+7. Object cache staleness: progress stored in user meta/transients while the course page is served from cache.
+8. Theme template overrides for LMS templates, missing updated hooks.
+
+## Prerequisites
+
+- A test student account (never debug progress with an admin account — admins are often exempt from caching/measurement).
+- Staging with the same LMS + plugin set.
+- Access to logs and the LMS's own debug/health report.
+
+## Investigation
+
+1. **Reproduce as a student** and capture the request that saves progress.
+
+```bash
+# from the browser: Network tab → the tutor ajax action; or from the server log
+grep -iE 'tutor|learn|quiz|complete' ~/logs/*access*.log | tail -30
+tail -n 80 wp-content/debug.log
+```
+
+2. **Verify the write reaches the database** — the decisive test.
+
+```sql
+-- Tutor LMS stores completion in course-completion/postmeta style tables;
+-- confirm with the LMS docs for the exact table in your version
+SELECT * FROM wp_postmeta WHERE meta_key LIKE '%_tutor_course_complete%' LIMIT 5;
+SELECT user_id, meta_key, LEFT(meta_value,60) FROM wp_usermeta WHERE meta_key LIKE '%course%' LIMIT 5;
+```
+
+3. **Check caching rules** for logged-in users and LMS endpoints.
+
+```bash
+curl -sSI https://example.com/courses/demo/ | grep -iE 'cache-control|cf-cache|set-cookie'
+```
+
+4. **Check cron/queue health** ([cron article](/wordpress/cron-not-running)) — queued jobs explain "progress visible later but not now".
+
+5. **Confirm capabilities**: if a custom role was configured, verify it includes the LMS's progress capability.
+
+```bash
+wp cap list student 2>/dev/null | tr ',' '\n' | grep -i -E 'course|quiz|lesson' | head
+```
+
+6. **Disable analytics/gamification plugins on staging** to test the hook-conflict hypothesis ([plugin conflict](/plugins/plugin-conflict)).
+
+## Diagnosis
+
+| Evidence | Cause | Action |
+| --- | --- | --- |
+| AJAX returns 403 | security plugin/WAF or nonce | whitelist endpoint, exclude LMS pages from cache |
+| AJAX returns 500 | PHP fatal | read log, isolate plugin |
+| AJAX 200 but no DB write | logic/permission/conflict | check caps, disable competing hook plugin |
+| Progress resets after purge | cached pages for logged-in users | bypass cache for logged-in roles |
+| Works instantly for admins, not students | caching/compat rules | reproduce with a real student account |
+| Quizzes pending for hours | cron backlog | drain queue, fix cron |
+| Certificates missing | template/asset or queue | check certificate template + cron |
+
+::: investigate
+Investigation mindset: separate *write* from *read*. If the database contains the completion, the bug is presentation/cache; if it does not, the bug is in the request path. That single test removes half the search space in one query.
+:::
+
+## Resolution
+
+1. **Exclude LMS pages and endpoints from caching**; ensure cache bypass for logged-in users and for the lesson/quiz AJAX actions.
+2. **Whitelist AJAX endpoints** in security plugins (`admin-ajax.php` with tutor/learndash/lifter actions) and reserve CAPTCHA for forms, not internal calls.
+3. **Fix the write path**: correct capabilities, update or replace the conflicting plugin, and move heavy completion side effects (emails, reports) to background jobs.
+4. **Drain and monitor the queue** so deferred processing is not mistaken for lost data.
+5. **Update LMS templates** in your theme: refresh overrides against the current LMS version and re-apply customisations.
+6. **Recompute progress** once after fixing, using the LMS's own recalculation tool (or a documented SQL-safe routine), so students are not left at incorrect percentages.
+
+## Verification
+
+- A student account completes a lesson; reload shows the change and the course bar updates.
+- Quiz submission produces results immediately and appears in the student's report.
+- Progress survives: cache purge, deploy, logout/login, and a different browser.
+- Certificate generation triggers within one cron cycle.
+
+## Root Cause
+
+LMS stacks are stateful: progress writes happen over AJAX and are read from cached HTML. Breakage usually means either the write was refused (permissions/edge) or the read was stale (cache), not that data was lost.
+
+## Prevention
+
+- Document LMS-specific cache and WAF exceptions as part of deployment (they are not optional).
+- Always test with a real student role, including on mobile.
+- Keep gamification/analytics additions limited and tested against the completion hook.
+- Monitor queue health and AJAX error rates during enrolment peaks.
+
+## Related Articles
+
+- [/wordpress/cron-not-running](/wordpress/cron-not-running)
+- [/plugins/plugin-conflict](/plugins/plugin-conflict)
+- [/woocommerce/cart-session-lost](/woocommerce/cart-session-lost)
+- [/checklists/performance](/checklists/performance)
+
+## Official References
+
+- [Tutor LMS documentation](https://docs.tutorlms.com/)
+- [LearnDash documentation](https://www.learndash.com/support/docs/)
+- [WordPress: AJAX in plugins](https://developer.wordpress.org/plugins/javascript/ajax/)

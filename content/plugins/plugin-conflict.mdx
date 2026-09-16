@@ -1,0 +1,132 @@
+---
+title: "Plugin Conflict Diagnosis"
+description: "The halving method, hook-level conflict analysis, and how to deliver a fix instead of a disabled plugin. Includes the modern conflicts (HPOS, nonces, cache)."
+difficulty: Intermediate
+timeToFix: "30–120 min"
+appliesTo: [Plugins, Themes, WooCommerce, Elementor]
+tags: [plugin, debug, woocommerce, elementor, hooks]
+severity: High
+updated: 2026-01-18
+featured: true
+---
+
+## Symptoms
+
+- One feature breaks while the rest of the site behaves normally (a form, an AJAX action, a checkout step, the editor).
+- The failure is reproducible with a specific user role, session state or page template.
+- Disabling a plugin "fixes" it — but you cannot leave that plugin disabled, and the real conflict is unclear.
+- Intermittent failures under load (cache + session interactions).
+
+## Possible Causes
+
+1. Two plugins hooking the same action/filter with incompatible assumptions or priorities.
+2. A fatal or `exit` in one callback preventing later callbacks on that hook from running.
+3. Nonce/cookie/nonce-lifetime conflicts between plugins and page cache.
+4. WooCommerce HPOS: plugins still querying `wp_posts` for orders.
+5. Duplicate functionality: two SEO plugins, two caching plugins, a snippet manager plus a plugin doing the same job.
+6. REST/AJAX namespace collisions or filters rewriting each other's responses.
+7. PHP version differences: one plugin declares a method scope/type that breaks another's inheritance.
+
+## Prerequisites
+
+- A staging clone (or a maintenance window and a signed-off plan for production).
+- The exact reproduction path plus the failing user role.
+- Query Monitor installed on staging, and logging enabled.
+
+## Investigation
+
+1. **Write the failing path as one precise sentence.** "Place order from checkout returns 500 for logged-out users only." Scope decides speed.
+2. **Capture the error before changing anything.**
+
+```bash
+tail -f wp-content/debug.log
+# browser: Network → failing request → response body; Console for JS errors
+```
+
+3. **Use halving, not linear elimination** — O(log n) passes instead of O(n).
+
+```bash
+wp plugin list --status=active --field=name
+wp plugin deactivate $(wp plugin list --status=active --field=name | head -n 8)   # first half
+# test, then swap halves until the offending plugin is isolated
+```
+
+4. **Then confirm the pair** — the conflict often needs both plugins active to reproduce.
+
+```bash
+wp plugin activate plugin-a plugin-b && curl -sS -o /dev/null -w '%{http_code}\n' https://staging.example.com/checkout/
+```
+
+5. **Inspect the hook battlefield** when two plugins claim the same feature.
+
+```bash
+wp eval 'global $wp_filter; $h=$wp_filter["init"]; foreach($h->callbacks as $p=>$cbs){ foreach($cbs as $id=>$c){ echo "$p\t$id\n"; } }' | head -40
+```
+
+6. **Test the modern conflict classes explicitly.**
+
+| Conflict class | How to test |
+| --- | --- |
+| Cache vs nonce | purge cache, retest as logged-out user in a fresh session |
+| HPOS vs order plugins | WooCommerce → Settings → Advanced → Features → compatibility mode On/Off |
+| REST/AJAX auth | call the endpoint with `wp_remote_get`/curl including cookies |
+| Editor (Elementor/Gutenberg) | Safe Mode / disable non-core widgets |
+| CSS/JS optimisers | disable minify/combine and retest |
+
+::: investigate
+Investigation mindset: prove the interaction, not just the plugin. "It works when plugin X is off" is a hypothesis; "it fails only when X and Y are both active, at hook `woocommerce_checkout_order_processed` priority 10" is a finding you can fix or report.
+:::
+
+## Diagnosis
+
+- Failure disappears with either plugin disabled → two-plugin conflict; go to hook analysis.
+- Failure persists with all plugins disabled → theme or core/snippet.
+- Failure only for logged-out users → session, nonce or cache.
+- Failure only on one host/stack → configuration difference (OPcache, object cache, PHP version).
+
+## Resolution
+
+1. Check for updates on both plugins; a surprising number of conflicts are already fixed upstream.
+2. Reorder responsibility: move a snippet into a child theme, or replace duplicate functionality with one plugin (two SEO plugins is a support ticket generator).
+3. If the conflict is in vendor code with no update: document it, add a temporary workaround (hook priority override via a small mu-plugin), and open an upstream report with:
+   - WP / PHP / plugin versions
+   - exact hook names and priorities
+   - the fatal or wrong output
+   - minimal reproduction steps
+4. If isolation, add a guard: a staging test, a PHP version pin, or a feature flag so the site stays usable while the vendor fixes it.
+
+```php
+// mu-plugin: run our callback after the conflicting one
+add_action( 'woocommerce_checkout_order_processed', 'lab_fix_order_data', 99 );
+```
+
+## Verification
+
+- The originally failing feature works with both plugins active.
+- End-to-end check for the affected integration: email delivered, order state correct, editor saves, form submits.
+- No new fatal/warning entries in the log from the reproduction.
+- Regression test documented in the ticket with versions, so the next update can be verified.
+
+## Root Cause
+
+Plugins are independent programs sharing one runtime. They conflict through shared global state: hooks, option names, REST routes, nonces, DOM selectors, and cache entries.
+
+## Prevention
+
+- Keep the plugin inventory short; prefer one plugin per responsibility.
+- Test plugin and theme updates on staging with a scripted checklist of critical flows.
+- Pin versions for critical integrations and upgrade deliberately, not automatically.
+- Log hook collisions on staging periodically (a quick `wp eval` dump is enough) — it catches conflicts before customers do ([/checklists/debug](/checklists/debug)).
+
+## Related Articles
+
+- [/plugins/plugin-fatal-error](/plugins/plugin-fatal-error)
+- [/elementor/safe-mode](/elementor/safe-mode)
+- [/woocommerce/checkout-broken](/woocommerce/checkout-broken)
+- [/runbooks/plugin-conflict](/runbooks/plugin-conflict)
+
+## Official References
+
+- [Plugin Handbook: Hooks](https://developer.wordpress.org/plugins/hooks/)
+- [WooCommerce: HPOS compatibility](https://woocommerce.com/document/high-performance-order-storage/)
+- [Elementor: Safe Mode](https://elementor.com/help/safe-mode/)

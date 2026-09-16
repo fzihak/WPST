@@ -1,0 +1,128 @@
+---
+title: "Elementor CSS Not Loading (Unstyled Sections)"
+description: "When Elementor content renders without its generated styles: fix the CSS cache, permissions, optimisation plugins and container/breakpoint mismatches."
+difficulty: Intermediate
+timeToFix: "20–60 min"
+appliesTo: [Elementor, Elementor Pro, Caching, Filesystem]
+tags: [elementor, css, cache, hosting, frontend]
+severity: High
+updated: 2026-01-01
+featured: true
+---
+
+## Symptoms
+
+- Elementor pages look unstyled: columns collapse, spacing disappears, fonts revert.
+- Some pages are fine, others not; often pages edited or imported most recently.
+- Styling appears after regenerating CSS but breaks again after a cache purge, deploy, or host migration.
+- Editor (frontend preview) looks correct while the published page does not — or the reverse.
+
+## Possible Causes
+
+1. Generated CSS files missing or stale in `wp-content/uploads/elementor/css` (deleted, not writable, restored from an incomplete backup).
+2. Page/object/CDN cache serving HTML with references to old CSS file hashes.
+3. An optimisation plugin (minify/combine/defer) aggressively dropping Elementor stylesheets.
+4. Filesystem permissions or ownership changed by a migration, deploy, or security hardening pass.
+5. Container/flexbox migration: pages built with sections still using legacy markup while the site expects containers (or vice versa).
+6. CSS loaded inline (elementor's "CSS Print Method: Internal") blocked by a CSP.
+7. Broken `wp_options` entry: `elementor_css_print_method` or a corrupted cache record.
+
+## Prerequisites
+
+- Elementor → Tools access (regenerate CSS & data).
+- SFTP/SSH to check that the uploads directory is writable by the web user.
+- A staging environment for testing plugin deactivation.
+
+## Investigation
+
+1. **Confirm which CSS files the page requests** and their status codes.
+
+```bash
+curl -sS https://example.com/sample-page/ | grep -oE 'elementor/css/[^"?]+' | sort -u | head
+curl -sSI https://example.com/wp-content/uploads/elementor/css/post-123.css | head -4
+```
+
+2. **Check whether the generated files exist and are writable.**
+
+```bash
+ls -la wp-content/uploads/elementor/css | head
+stat -c '%a %U:%G %n' wp-content/uploads/elementor wp-content/uploads/elementor/css
+find wp-content/uploads/elementor -type f -newermt '-1 day' | head
+```
+
+3. **Regenerate and observe** — the regenerate step reveals permission errors in the log.
+
+```bash
+wp elementor flush-css 2>/dev/null || echo "use Elementor → Tools → Regenerate CSS & Data"
+tail -n 40 wp-content/debug.log
+```
+
+4. **Check the print method and cache settings.**
+
+```bash
+wp option get elementor_css_print_method
+wp option get elementor_experiment-e_font_icon_svg 2>/dev/null
+```
+
+5. **Disable optimisers** (staging) and retest to confirm they are dropping files, not Elementor itself.
+
+```bash
+wp plugin list --status=active --field=name | grep -Ei 'rocket|autoptim|litespeed|minif|perfmatters|nitro'
+```
+
+6. **Use Elementor Safe Mode** to test without other plugins/theme ([safe mode article](/elementor/safe-mode)).
+
+## Diagnosis
+
+| Evidence | Cause | Fix |
+| --- | --- | --- |
+| `elementor/css/*.css` requests 404 | files missing | regenerate CSS, ensure writable |
+| Files exist but HTML references older hash | stale page cache | purge page cache + CDN, then regenerate |
+| Styling present in editor only | frontend cache/optimiser | exclude Elementor files from minify/combine |
+| Regeneration fails silently, log shows "Permission denied" | ownership | fix owner, not 777 |
+| Layout wrong but styles present | containers/flexbox migration | review container settings per section |
+| Inline styles blocked in console (CSP) | CSS print method | switch to External File, or allow inline CSS |
+
+::: investigate
+Investigation mindset: split the problem into two questions — is the CSS *generated*, and is it *delivered*? Regeneration failures and delivery failures need different tools, and mixing them wastes an hour.
+:::
+
+## Resolution
+
+1. Regenerate CSS & Data, then purge every cache layer in order (page → object → CDN → OPcache/browser).
+2. Fix filesystem: directories 755, files 644, owner = hosting user, and verify with `sudo -u wwwuser touch` test.
+3. Configure the optimiser correctly: exclude `/wp-content/uploads/elementor/` and Elementor's handles from minify/combine/defer; never enable "remove unused CSS" on builder pages without testing.
+4. If a CSP is in play, either serve CSS as an external file or allow `'unsafe-inline'` for the specific page path (or nonce-based inline handling where the host supports it).
+5. For imported templates: re-save the page once in the editor after import so its CSS is regenerated against the current kit.
+6. For container/flexbox issues: convert sections to containers page by page, testing each; do not switch the site-wide experiment mid-campaign without testing key pages.
+
+## Verification
+
+- All `elementor/css/*.css` requests return 200 or are properly inlined; no 404s in the Network tab.
+- Published page renders identically to the editor preview on desktop, tablet and mobile breakpoints.
+- After a full cache purge the page still renders — proving delivery does not depend on a warm cache.
+- No new entries in `debug.log` from regeneration.
+
+## Root Cause
+
+Elementor generates per-post CSS on save/edit and caches it in uploads. Layout breakage therefore comes from generation (permissions, corrupted data), delivery (cache, optimisers, CSP) or data-model changes (containers/breakpoints) — three separate investigations.
+
+## Prevention
+
+- Keep uploads writable and never delete `uploads` during cleanups; delete specific folders instead.
+- Add "regenerate builder CSS after deploy" to the release process for builder-based sites.
+- Avoid stacking optimisation plugins; pick one and configure it once.
+- Test both a section-based and container-based page before switching site-wide experiments.
+
+## Related Articles
+
+- [/elementor/safe-mode](/elementor/safe-mode)
+- [/themes/broken-layout](/themes/broken-layout)
+- [/plugins/plugin-conflict](/plugins/plugin-conflict)
+- [/performance/ttfb](/performance/ttfb)
+
+## Official References
+
+- [Elementor: Regenerate CSS & Data](https://elementor.com/help/regenerate-css-data/)
+- [Elementor: Flexbox containers](https://elementor.com/help/flexbox-container/)
+- [Elementor: Safe Mode](https://elementor.com/help/safe-mode/)

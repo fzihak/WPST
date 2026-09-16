@@ -1,0 +1,142 @@
+---
+title: "Plugin Fatal Error"
+description: "A plugin crash after an update, a PHP bump or a half-completed install. Read the stack trace, roll back safely, and write an upstream report that gets fixed."
+difficulty: Intermediate
+timeToFix: "15–45 min"
+appliesTo: [Plugins, PHP, WordPress Core]
+tags: [plugin, fatal-error, php, logs, update]
+severity: Critical
+updated: 2026-01-03
+---
+
+## Symptoms
+
+- "There has been a critical error" or a white screen traced to a plugin file.
+- `PHP Fatal error: Uncaught Error: Call to undefined function … in /wp-content/plugins/<plugin>/…php:123`.
+- Site works until a specific action runs (activating a licence, saving settings, opening a specific admin page).
+- Happens right after a plugin update or a PHP version change; other plugins are unaffected.
+
+## Possible Causes
+
+1. PHP incompatibility: removed/deprecated functions, typed property issues, `str_contains` on PHP 7.
+2. Half-completed update: old files plus new ones, or missing vendor autoload files.
+3. A dependency conflict: the plugin requires a newer WooCommerce/Elementor/core version.
+4. Custom code (snippet, child theme, mu-plugin) calling a plugin function that no longer exists.
+5. Corrupted download during install (rare, but happens with strict WAFs or disk issues).
+6. Malware that modified plugin files (`eval` injections usually produce unrelated fatals).
+
+## Prerequisites
+
+- The complete fatal message including file, line and stack trace.
+- The previous version of the plugin available for rollback.
+- Staging when possible; otherwise a backup and a rollback plan.
+
+## Investigation
+
+1. **Read the fatal literally.** `Call to undefined function`, `Class not found`, `Cannot redeclare`, `Uncaught TypeError` each point at a different mechanism.
+
+```bash
+grep -i 'PHP Fatal' ~/logs/php_error.log | tail -20
+tail -n 40 wp-content/debug.log
+```
+
+2. **Confirm the plugin and version involved.**
+
+```bash
+wp plugin get suspect-plugin --fields=name,title,status,version,update
+wp plugin list --status=active --fields=name,version,update
+```
+
+3. **Check the environment against the plugin's requirements.**
+
+```bash
+php -v && wp core version
+wp plugin list --fields=name,version,requires_php 2>/dev/null
+php -l wp-content/plugins/suspect/suspect.php
+```
+
+4. **Isolate to be certain.** Rename the folder and see whether the fatal disappears; then test a rollback version.
+
+```bash
+mv wp-content/plugins/suspect ~/disabled/suspect
+wp plugin install suspect --version=1.9.2 --activate
+```
+
+5. **Verify whether the site was mid-update** (mixed files indicate an interrupted install).
+
+```bash
+ls -la wp-content/upgrade/ 2>/dev/null
+find wp-content/plugins/suspect -name '*.php' -newermt '-1 hour' | head
+```
+
+6. **Check for modification** with checksums where the plugin is on wordpress.org.
+
+```bash
+wp plugin verify-checksums suspect
+```
+
+## Diagnosis
+
+| Fatal text | Likely mechanism | First action |
+| --- | --- | --- |
+| `Call to undefined function str_contains()` | plugin needs PHP 8, site runs 7.4 | update plugin or raise PHP |
+| `Class "Vendor\X" not found` | missing autoloader (partial install) | reinstall the plugin |
+| `Cannot redeclare` | duplicate file (two copies, snippet) | remove the duplicate |
+| `Uncaught TypeError` on args | newer core/WooCommerce signature | update the plugin or pin the dependency |
+| `Maximum function nesting level` | recursion between plugins | disable one of the pair |
+| Fatal only in admin | admin-only code path | reproduce with Query Monitor |
+
+::: investigate
+Investigation mindset: PHP tells you exactly what it could not do. Translate the message into one of four mechanisms — missing function/class, wrong types, duplicate declaration, or recursion — and the fix path becomes obvious.
+:::
+
+## Resolution
+
+1. **Restore service immediately**: deactivate or roll back the plugin.
+
+```bash
+wp plugin deactivate suspect
+# or in the dashboard via Recovery Mode
+```
+
+2. **Update the plugin** if a compatible version exists; otherwise install the last known-good version and mark the site as pending an upstream fix.
+3. **Align the environment** if the plugin requires a newer PHP/WooCommerce/core release — plan it, do not do it live, and check the rest of the plugin set for compatibility.
+4. **Fix your own code** if a snippet or mu-plugin is calling a removed function; search for the function name across `wp-content`.
+
+```bash
+grep -rn "old_plugin_function(" wp-content --include='*.php' | head
+```
+
+5. **Reinstall cleanly** when files are inconsistent: delete the plugin folder, install from a fresh download, then configure.
+6. **Report upstream** with: WP/PHP/Woo versions, plugin versions before and after, the exact fatal, a minimal reproduction, and whether deactivating other plugins changes the result.
+
+## Verification
+
+- The site loads with the plugin active (fixed version) for both frontend and admin.
+- No fatal when replaying the exact steps that produced it.
+- `wp plugin list` shows no plugin as "deactivated due to error".
+- If rolled back: a note in the ticket stating the pinned version and the reason.
+
+## Root Cause
+
+Fatal errors are unhandled programming failures inside the PHP request. The plugin's code assumed something the runtime did not provide: a function, a class, a type, or a version.
+
+## Prevention
+
+- Test plugin updates on staging with the PHP version you actually run in production.
+- Keep PHP and plugin support windows aligned; document the pinned versions.
+- Never edit vendor plugin code — a hotfix gets wiped by the next update; use hooks instead.
+- Keep a rollback copy of critical plugins (payment gateways, memberships, builders).
+
+## Related Articles
+
+- [/errors/white-screen-of-death](/errors/white-screen-of-death)
+- [/errors/500-internal-server-error](/errors/500-internal-server-error)
+- [/plugins/plugin-conflict](/plugins/plugin-conflict)
+- [/wordpress/recovery-mode](/wordpress/recovery-mode)
+
+## Official References
+
+- [Debugging in WordPress](https://developer.wordpress.org/advanced-administration/debug/debug-wordpress/)
+- [WordPress: Plugin compatibility & PHP versions](https://make.wordpress.org/core/handbook/)
+- [WP-CLI: plugin install](https://developer.wordpress.org/cli/commands/plugin/install/)
