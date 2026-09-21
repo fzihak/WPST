@@ -1,0 +1,200 @@
+---
+title: "Checkout AJAX & HPOS Synchronization Issues"
+description: "Triage WooCommerce checkout AJAX freezes, update_order_review infinite spinners, nonce expirations, and High-Performance Order Storage (HPOS) database desync."
+difficulty: Advanced
+timeToFix: "30–90 min"
+appliesTo: [WooCommerce, PHP, NGINX, Apache, Database]
+tags: [woocommerce, checkout, ajax, hpos, database]
+severity: Critical
+updated: 2026-02-18
+featured: true
+---
+
+## Symptoms
+
+- Placing an order displays an infinite grey loading overlay on the checkout page; the "Place order" button remains disabled indefinitely.
+- Browser DevTools Console reveals: `SyntaxError: Unexpected token '<', "<br /><b>Notice..." is not valid JSON` when parsing the response from `/?wc-ajax=update_order_review` or `/?wc-ajax=checkout`.
+- After completing checkout, customer accounts are charged, but no order record appears in **WooCommerce → Orders**, or orders appear in legacy `wp_posts` but not in the High-Performance Order Storage (`wp_wc_orders`) tables.
+- Notice in WooCommerce Site Health or logs: `"Order #12345 could not be synchronized with HPOS: Custom table record missing"`.
+- Error message at the top of checkout: `"Session expired. Please refresh the page and try again."` or `"An error occurred while processing your order"`.
+
+## Possible Causes
+
+1. **PHP Notice / Warning injection corrupting JSON**: A third-party shipping, tax, or payment plugin outputs PHP warnings or whitespace into stdout before `wp_send_json()` executes, breaking the client-side JSON parser.
+2. **HPOS (Custom Order Tables) synchronization desync**: HPOS is enabled with compatibility mode (`wp_posts` and `wp_wc_orders` dual storage), but the background sync process failed or timed out during order placement.
+3. **Checkout Nonce invalidation due to aggressive page caching**: A full-page caching plugin (Varnish, Cloudflare Cache Everything, WP Rocket) cached the checkout HTML containing an expired `woocommerce-process-checkout-nonce`.
+4. **Session cookie stripping by reverse proxies**: An NGINX, Fastly, or Cloudflare rule strips the `woocommerce_cart_hash`, `woocommerce_items_in_cart`, or `wp_woocommerce_session_*` cookies during the AJAX roundtrip.
+5. **Database deadlock on order auto-increment**: Concurrent orders during high-traffic sales lock the `wp_wc_orders` or `wp_wc_order_stats` primary key sequences.
+6. **Cart fragments AJAX blocking main thread**: Heavy `get_refreshed_fragments` calls queue up on PHP-FPM, delaying the `update_order_review` execution beyond the browser XHR timeout.
+
+## Prerequisites
+
+- Access to WordPress Administrator dashboard with WooCommerce management privileges.
+- Browser Developer Tools (Network and Console tabs) to inspect the raw AJAX payloads.
+- SSH or terminal access with WP-CLI installed.
+- Direct access to MySQL or phpMyAdmin to verify `wp_wc_orders` and `wp_posts` integrity.
+
+## Investigation
+
+1. **Inspect the raw Network response for `/?wc-ajax=update_order_review`**:
+   - In Chrome/Firefox DevTools, open the **Network** tab and filter by `wc-ajax`.
+   - Change a field on checkout (e.g., shipping country) to trigger the AJAX update.
+   - Click the failed request and check the **Response** tab. Look for PHP stack traces, whitespace, or HTML tags preceding `{"result":"success"}`.
+
+```bash
+# Direct cURL test simulating the checkout AJAX call
+curl -sS -X POST "https://example.com/?wc-ajax=update_order_review" \
+  -H "X-Requested-With: XMLHttpRequest" \
+  -d "security=INVALID_TEST&billing_country=US" | head -n 30
+```
+
+2. **Verify HPOS sync status via WP-CLI**:
+   Check if orders are desynchronized between legacy post tables and HPOS tables:
+
+```bash
+wp wc hpos status
+wp wc hpos verify-data
+```
+
+3. **Check for checkout page caching headers**:
+   Ensure edge CDNs and page caches return `Cache-Control: no-store, no-cache, must-revalidate` on checkout:
+
+```bash
+curl -sI https://example.com/checkout/ | grep -Ei 'cache-control|x-cache|cf-cache-status'
+```
+
+4. **Inspect WooCommerce fatal logs**:
+   Navigate to **WooCommerce → Status → Logs** and check the latest `fatal-errors-*.log` and `wc-orders-sync-*.log`.
+
+```bash
+tail -n 60 wp-content/uploads/wc-logs/fatal-errors-*.log
+```
+
+5. **Examine database write locks and table health**:
+   Confirm whether `wp_wc_orders` and `wp_wc_order_meta` exist and are writeable:
+
+```sql
+SHOW TABLE STATUS LIKE 'wp_wc_orders%';
+SELECT COUNT(*) FROM wp_posts WHERE post_type = 'shop_order';
+SELECT COUNT(*) FROM wp_wc_orders;
+```
+
+::: investigate
+Investigation mindset: The checkout AJAX spinner never stops because the JavaScript listener expects a strict JSON object `{ result: "...", messages: "..." }`. If PHP outputs even a single invisible byte (like a UTF-8 BOM or a deprecated warning) before the headers, `JSON.parse()` crashes silently in the browser. Always inspect the **raw response text**, not the parsed JSON tab.
+:::
+
+## Diagnosis
+
+| Observed Error / Behavior | Diagnostic Indicator | Root Cause |
+| --- | --- | --- |
+| `SyntaxError: Unexpected token <` | HTML or PHP notice in `update_order_review` response | Plugin outputting PHP notice/warning before JSON response |
+| Infinite spinner, response is 403 Forbidden | `{"result":"failure","messages":"Session expired"}` | Expired nonce rendered from a cached checkout page |
+| Order appears in payment gateway but missing in Admin | `wp wc hpos verify-data` reports un-synced IDs | HPOS synchronization interrupted; order stuck in `wp_posts` or sync queue |
+| AJAX request aborted after 60s with HTTP 504 | Upstream FastCGI read timeout on `admin-ajax.php` | Shipping or tax API hanging on synchronous rate calculation |
+| Cart empties automatically on checkout submit | Missing `Set-Cookie` in response headers | Host/CDN caching rules stripping `wp_woocommerce_session_*` |
+
+## Resolution
+
+1. **Silence PHP output buffers during AJAX execution**:
+   Disable `display_errors` in production so warnings cannot contaminate JSON payloads:
+
+```php
+// In wp-config.php (before the stop editing line)
+@ini_set( 'display_errors', '0' );
+define( 'WP_DEBUG_DISPLAY', false );
+```
+
+2. **Repair and Synchronize HPOS Database Tables**:
+   If HPOS tables are out of sync or missing orders, trigger an authoritative synchronization via WP-CLI:
+
+```bash
+# Synchronize pending orders from postmeta to HPOS tables
+wp wc hpos sync --batch-size=500
+
+# Verify synchronization integrity
+wp wc hpos verify-data
+
+# If a third-party plugin is incompatible, temporarily switch back to posts storage:
+# In WP-Admin -> WooCommerce -> Settings -> Advanced -> Features -> Order data storage:
+# Select "WordPress posts storage (legacy)"
+```
+
+3. **Exclude Checkout from All Full-Page Caches**:
+   Ensure page cache plugins and reverse proxies completely bypass caching for WooCommerce core paths:
+   - Exclude URLs: `/cart/*`, `/checkout/*`, `/my-account/*`, `/?wc-ajax=*`.
+   - In NGINX:
+
+```nginx
+# NGINX cache bypass for WooCommerce
+if ($request_uri ~* "/(cart|checkout|my-account|wc-api|addons)/") {
+    set $skip_cache 1;
+}
+if ($http_cookie ~* "woocommerce_items_in_cart|wp_woocommerce_session") {
+    set $skip_cache 1;
+}
+```
+
+4. **Fix Shipping & Tax Calculation Timeouts**:
+   If an external carrier plugin (FedEx, UPS, TaxJar) delays `update_order_review`, add a strict timeout filter:
+
+```php
+<?php
+/**
+ * Plugin Name: WC Checkout AJAX Protection
+ * Description: Prevents hanging shipping/tax API calls from breaking checkout AJAX.
+ */
+add_filter( 'http_request_args', function( $args, $url ) {
+    if ( ! empty( $_GET['wc-ajax'] ) ) {
+        // Enforce 8-second ceiling on external HTTP requests during checkout AJAX
+        $args['timeout'] = 8;
+    }
+    return $args;
+}, 20, 2 );
+```
+
+5. **Clean Corrupted WooCommerce Transients and Sessions**:
+   Clear stalled customer sessions and cached shipping rates:
+
+```bash
+wp wc tool run clear_transients
+wp wc tool run delete_expired_transients
+```
+
+## Verification
+
+- Add a product to the cart and proceed to checkout.
+- Inspect browser Console: Ensure zero `SyntaxError` or JavaScript exceptions appear when changing addresses or shipping options.
+- Verify `update_order_review` returns HTTP 200 with pure JSON payload:
+  ```bash
+  curl -sS -X POST "https://example.com/?wc-ajax=update_order_review" \
+    -H "X-Requested-With: XMLHttpRequest" | head -n 1
+  ```
+- Complete a test transaction using a sandbox gateway:
+  Confirm the order appears immediately under **WooCommerce → Orders**, customer receives the confirmation email, and HPOS record matches:
+  ```bash
+  wp wc shop_order list --limit=1
+  ```
+
+## Root Cause
+
+WooCommerce's single-page checkout relies on continuous client-server synchronization via asynchronous XMLHttpRequest endpoints (`?wc-ajax=update_order_review`). When edge caches serve stale security nonces, when plugins leak PHP notices into the response stream, or when HPOS transactional tables encounter concurrency deadlocks, the JavaScript client cannot parse the payload, terminating the state machine and freezing the user interface.
+
+## Prevention
+
+- Never enable page caching or HTML minification on `/checkout/` or `/cart/`.
+- Conduct regular HPOS database verification runs (`wp wc hpos verify-data`) after plugin updates.
+- Monitor PHP error logs with real-time alerting for notices on `update_order_review`.
+- Ensure all installed third-party extensions declare explicit compatibility with WooCommerce HPOS.
+
+## Related Articles
+
+- [/woocommerce/checkout-broken](/woocommerce/checkout-broken)
+- [/woocommerce/payment-failed](/woocommerce/payment-failed)
+- [/woocommerce/cart-session-lost](/woocommerce/cart-session-lost)
+- [/errors/504-gateway-timeout](/errors/504-gateway-timeout)
+
+## Official References
+
+- [WooCommerce Developer: High-Performance Order Storage (HPOS) Guide](https://developer.woocommerce.com/docs/features/high-performance-order-storage/)
+- [WooCommerce: Troubleshooting Checkout AJAX Issues](https://woocommerce.com/document/troubleshooting-checkout-issues/)
+- [WordPress Core: wp_send_json and AJAX Headers](https://developer.wordpress.org/reference/functions/wp_send_json/)
