@@ -1,0 +1,201 @@
+---
+title: "Error Uploading File (Media Library HTTP Error)"
+description: "Fixing generic 'HTTP error' and upload failures in WordPress: isolate ImageMagick policy and thread limits, resolve upload_tmp_dir permissions, and size client limits correctly."
+difficulty: Intermediate
+timeToFix: "15–45 min"
+appliesTo: [WordPress Core, Media, PHP, Apache, NGINX]
+tags: [media, uploads, permissions, php, imagemagick]
+severity: High
+updated: 2026-02-15
+featured: true
+---
+
+## Symptoms
+
+- Uploading an image in Media Library displays a generic red banner: `"HTTP error."` or `"An error occurred in the upload. Please try again later."`
+- Small images (under 500 KB or 1000px) upload successfully, but modern high-resolution phone photos (4K, HEIC, 10MB+) immediately fail with HTTP error.
+- The progress bar reaches 100% (the binary uploads completely), but the failure triggers immediately during the post-processing and thumbnail generation phase.
+- File system error: `"Unable to create directory wp-content/uploads/2026/02. Is its parent directory writable by the server?"`
+- Browser network tab exposes `POST /wp-admin/async-upload.php` returning `HTTP 500 Internal Server Error` or `HTTP 413 Payload Too Large`.
+
+## Possible Causes
+
+1. **ImageMagick memory / thread limits (`policy.xml`)**: ImageMagick runs out of memory or disk cache when generating intermediate thumbnails (`thumbnail`, `medium`, `large`, `2048x2048`) for high-resolution images.
+2. **PHP memory exhaustion during resize**: Uncompressed bitmap image processing requires `width * height * 4 bytes * 2.5` of uncompressed RAM in PHP memory, breaching `memory_limit`.
+3. **Mismatched PHP upload boundaries**: `post_max_size` is smaller than `upload_max_filesize`, causing PHP to silently drop POST payloads.
+4. **Web server client body limits**: NGINX `client_max_body_size` or Apache `LimitRequestBody` rejects large file transfers before reaching PHP, returning `413 Request Entity Too Large`.
+5. **Permissions or missing `upload_tmp_dir`**: The operating system temporary directory (`/tmp`) is full, read-only, restricted by `open_basedir`, or `wp-content/uploads/` has incorrect file ownership (`chown`).
+6. **Corrupt file metadata or missing PHP modules**: Missing `php-imagick` or `php-gd`, or security plugins filtering EXIF data stripping headers.
+
+## Prerequisites
+
+- SSH or SFTP access to inspect directory permissions, `php.ini`, and web server configs.
+- Access to WordPress admin account with `upload_files` capability.
+- Access to PHP error logs (`wp-content/debug.log` or server error logs).
+- Disk space availability check on root and `/tmp` partitions (`df -h`).
+
+## Investigation
+
+1. **Inspect the browser DevTools Network response**:
+   Open Network tab, attempt an image upload, and inspect the failed `async-upload.php` request headers and response body.
+
+2. **Verify disk space and inode availability**: A full disk or exhausted inode table instantly kills uploads.
+
+```bash
+df -h
+df -i
+```
+
+3. **Check the temporary upload directory and uploads directory permissions**:
+   Ensure the web server user (`www-data`, `nginx`, or cPanel account user) owns the directory:
+
+```bash
+# Check uploads folder permissions
+ls -ld wp-content/uploads/
+
+# Check system /tmp or custom PHP upload_tmp_dir
+php -r 'echo "upload_tmp_dir: " . ini_get("upload_tmp_dir") . "\n";'
+php -r 'echo "sys_temp_dir: " . sys_get_temp_dir() . "\n";'
+ls -ld /tmp
+```
+
+4. **Verify PHP upload directives and memory ceiling**:
+
+```bash
+php -r 'echo "upload_max_filesize: " . ini_get("upload_max_filesize") . "\n";'
+php -r 'echo "post_max_size: " . ini_get("post_max_size") . "\n";'
+php -r 'echo "memory_limit: " . ini_get("memory_limit") . "\n";'
+```
+
+5. **Read the PHP error log for ImageMagick / GD crashes**:
+
+```bash
+grep -Ei 'imagecreatetruecolor|imagick|memory|async-upload' /var/log/php*-fpm.log ~/logs/php_error.log wp-content/debug.log 2>/dev/null | tail -n 20
+```
+
+::: investigate
+Investigation mindset: If the file reaches 100% upload before turning red with "HTTP Error", **the network transfer succeeded**. The failure is happening during **server-side image processing** (ImageMagick thumbnail creation or memory exhaustion). If it fails at 1% instantly, it is a web server payload limit or permissions block.
+:::
+
+## Diagnosis
+
+| Diagnostic Symptom / Error | Failure Phase | Root Cause |
+| --- | --- | --- |
+| Error appears instantly at 0-5% progress; HTTP 413 | Pre-upload | NGINX `client_max_body_size` or Apache `LimitRequestBody` too low |
+| Reaches 100% progress, hangs 5s, then red "HTTP Error" | Thumbnail Generation | ImageMagick out of memory / thread lock or PHP `memory_limit` exhausted |
+| "Unable to create directory wp-content/uploads/..." | File Saving | Incorrect ownership (`chown`) or restrictive file permissions (`chmod`) |
+| Silent upload failure, empty response on `async-upload.php` | Request Intake | `post_max_size` is lower than `upload_max_filesize` |
+| `Fatal error: Allowed memory size exhausted` in `debug.log` | Resizing | High-megapixel image exceeds PHP RAM during uncompressed decoding |
+| "File type not permitted for security reasons" | MIME Check | Unsupported extension or missing MIME type in `upload_mimes` filter |
+
+## Resolution
+
+1. **Fix ImageMagick policy limits and thread contention (Most common cause of HTTP Error)**:
+   Modern Linux servers with multi-core CPUs often hit ImageMagick resource boundaries when handling large camera photos.
+
+   Open `/etc/ImageMagick-6/policy.xml` (or `/etc/ImageMagick-7/policy.xml`):
+   ```xml
+   <policy domain="resource" name="memory" value="512MiB"/>
+   <policy domain="resource" name="map" value="1024MiB"/>
+   <policy domain="resource" name="width" value="16KP"/>
+   <policy domain="resource" name="height" value="16KP"/>
+   <policy domain="resource" name="area" value="128MB"/>
+   <policy domain="resource" name="disk" value="2GiB"/>
+   <!-- Fix OpenMP multi-thread hangs on shared/VPS servers -->
+   <policy domain="resource" name="thread" value="1"/>
+   ```
+
+2. **Force WordPress to use GD Library as fallback editor**:
+   If ImageMagick continues to crash on constrained hosting, switch the image processing engine to PHP's GD library via an `mu-plugin`:
+
+```php
+<?php
+/**
+ * Plugin Name: Prefer GD Image Editor
+ * Description: Prevents ImageMagick crashes during heavy WordPress media uploads.
+ */
+add_filter( 'wp_image_editors', function( $editors ) {
+    return array( 'WP_Image_Editor_GD', 'WP_Image_Editor_Imagick' );
+} );
+```
+
+3. **Align PHP upload and memory limits**:
+   Ensure `post_max_size` is strictly greater than or equal to `upload_max_filesize`, and memory is sized for image transformations:
+
+```ini
+; php.ini or .user.ini
+upload_max_filesize = 64M
+post_max_size = 64M
+memory_limit = 512M
+max_execution_time = 300
+```
+
+In `wp-config.php`:
+```php
+define( 'WP_MEMORY_LIMIT', '256M' );
+define( 'WP_MAX_MEMORY_LIMIT', '512M' );
+```
+
+4. **Correct NGINX client payload limits**:
+   In your NGINX server block:
+
+```nginx
+# /etc/nginx/sites-available/example.com
+server {
+    client_max_body_size 64M;
+    # ...
+}
+```
+Reload NGINX: `nginx -t && systemctl reload nginx`.
+
+5. **Correct filesystem ownership and permissions**:
+   Set standard WordPress POSIX permissions:
+
+```bash
+# Correct ownership to web server user
+sudo chown -R www-data:www-data wp-content/uploads/
+
+# Standard directory and file permissions
+find wp-content/uploads/ -type d -exec chmod 755 {} \;
+find wp-content/uploads/ -type f -exec chmod 644 {} \;
+```
+
+6. **Fix `/tmp` sticky bit permissions**:
+   If system `/tmp` permissions were altered:
+```bash
+sudo chmod 1777 /tmp
+```
+
+## Verification
+
+- Navigate to **WP-Admin → Media → Add New** and upload a large 10MB+ raw phone photo.
+- Confirm image completes upload, generates thumbnails, and displays in the media grid.
+- Check that thumbnail sub-sizes exist on disk:
+  ```bash
+  ls -lh wp-content/uploads/$(date +%Y)/$(date +%m)/
+  ```
+- Verify `wp-content/debug.log` has zero fatal or warning entries related to `async-upload.php`.
+
+## Root Cause
+
+WordPress image uploads are a two-phase process: first, the binary file is streamed to the server's temporary directory; second, WordPress uncompresses the entire image into memory and uses an image processing library (`ImageMagick` or `GD`) to generate multiple thumbnail sizes. The generic "HTTP error" is almost always a failure of this second phase due to ImageMagick thread deadlocks, insufficient uncompressed RAM, or permission blocks on temporary directories.
+
+## Prevention
+
+- Pre-scale images before upload or install a lightweight optimization plugin to downscale huge images on client-side before submission.
+- Maintain adequate server memory and disk space alerting (alert at 80% partition usage).
+- Keep `WP_MAX_MEMORY_LIMIT` at 512M to ensure administrative thumbnail generation never starves.
+- Never use world-writable `777` permissions; always fix underlying POSIX user ownership.
+
+## Related Articles
+
+- [/errors/allowed-memory-size-exhausted](/errors/allowed-memory-size-exhausted)
+- [/errors/500-internal-server-error](/errors/500-internal-server-error)
+- [/security/file-permissions](/security/file-permissions)
+- [/php/memory-limit](/php/memory-limit)
+
+## Official References
+
+- [WordPress Developer: Image Editor Class Reference](https://developer.wordpress.org/reference/classes/wp_image_editor/)
+- [ImageMagick: Security Policy & Resource Limits](https://imagemagick.org/script/security-policy.php)
+- [PHP Manual: Handling File Uploads](https://www.php.net/manual/en/features.file-upload.php)
