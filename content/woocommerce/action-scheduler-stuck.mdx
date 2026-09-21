@@ -1,0 +1,194 @@
+---
+title: "Action Scheduler Queue Stuck & Backlog Saturation"
+description: "Triage and fix stalled Action Scheduler background queues: resolve deadlocks in wp_actionscheduler_actions, purge zombie runner locks, and clear order processing backlogs."
+difficulty: Advanced
+timeToFix: "20–60 min"
+appliesTo: [WooCommerce, Database, PHP, Hosting]
+tags: [woocommerce, action-scheduler, cron, database, backlog]
+severity: High
+updated: 2026-02-18
+featured: true
+---
+
+## Symptoms
+
+- Orders are placed, but transactional emails (Order Confirmation, Admin Notifications) are delayed by hours or never send.
+- WooCommerce Subscriptions fail to renew at their scheduled billing intervals.
+- The `wp_actionscheduler_actions` and `wp_actionscheduler_logs` database tables balloon to hundreds of thousands or millions of rows, consuming gigabytes of disk storage.
+- In **WooCommerce → Status → Scheduled Actions**, the **Pending** or **Past-due** count increases continuously, while **In-progress** actions remain stuck for days with ancient timestamps.
+- Webhook deliveries (Stripe, Zapier, ShipStation, ERP syncs) stop dispatching or report massive queues.
+- Fatal error in logs: `Deadlock found when trying to get lock; try restarting transaction` referencing `wp_actionscheduler_actions`.
+
+## Possible Causes
+
+1. **Zombie runner locks**: An Action Scheduler batch worker died mid-execution (due to an unhandled PHP fatal error, out-of-memory kill, or server reboot), leaving a persistent concurrency lock transient in `wp_options` that blocks all future runners.
+2. **Heavy un-chunked actions causing execution timeouts**: A single plugin schedules an action that takes >120 seconds to run (e.g., syncing 50,000 products to Facebook/Google), timing out the queue on every execution attempt.
+3. **Reliance on default WP-Cron (visitor-driven)**: Low-traffic sites or sites behind aggressive full-page caches do not receive the HTTP traffic required to trigger the Action Scheduler queue runner via `wp-cron.php`.
+4. **Table bloat and missing database indexes**: The `wp_actionscheduler_logs` table has millions of accumulated completed actions, turning simple queue lookup queries into full table scans.
+5. **Database concurrency deadlocks**: Multiple asynchronous workers or high-traffic cron requests attempt to claim the same batch of action IDs simultaneously under high MySQL load.
+
+## Prerequisites
+
+- Access to WordPress Administrator account with WooCommerce management privileges.
+- Shell access with WP-CLI installed.
+- Access to MySQL / MariaDB command line or phpMyAdmin.
+- Understanding of server cron (`crontab -e`) to configure high-frequency background processing.
+
+## Investigation
+
+1. **Check Action Scheduler status via WP-CLI**:
+   List pending, in-progress, and failed actions to determine the size of the backlog:
+
+```bash
+# Count actions by status
+wp action-scheduler list --status=in-progress
+wp action-scheduler list --status=failed
+wp action-scheduler list --status=pending --posts_per_page=10
+```
+
+2. **Check for stalled concurrency locks in `wp_options`**:
+   Inspect if Action Scheduler believes a batch runner is still active:
+
+```bash
+wp option get action_scheduler_lock_async-request-runner
+wp db query "SELECT option_name, option_value FROM wp_options WHERE option_name LIKE 'action_scheduler_lock_%';"
+```
+
+3. **Measure database table bloat**:
+   Inspect row counts and physical disk size for Action Scheduler tables:
+
+```sql
+SELECT TABLE_NAME, TABLE_ROWS, 
+       ROUND((DATA_LENGTH + INDEX_LENGTH) / 1024 / 1024, 2) AS "Size_MB"
+FROM information_schema.TABLES
+WHERE TABLE_SCHEMA = DATABASE() 
+  AND TABLE_NAME LIKE 'wp_actionscheduler_%';
+```
+
+4. **Identify the specific action hook causing queue blockage**:
+   Find the oldest "in-progress" or "pending" actions that have past-due execution dates:
+
+```sql
+SELECT action_id, hook, status, scheduled_date_gmt 
+FROM wp_actionscheduler_actions 
+WHERE status IN ('in-progress', 'pending') 
+ORDER BY scheduled_date_gmt ASC 
+LIMIT 10;
+```
+
+5. **Test manual execution via WP-CLI to capture real-time errors**:
+
+```bash
+wp action-scheduler run --batch-size=50 --force
+```
+
+::: investigate
+Investigation mindset: Action Scheduler utilizes **concurrency locks** to prevent two workers from executing the same task. If a server process runs out of memory while processing an action, the OS kills PHP instantly (`SIGKILL`), preventing PHP from running shutdown handlers. The lock remains stuck in the database forever until purged, starving all subsequent actions.
+:::
+
+## Diagnosis
+
+| Observed Diagnostic Signature | Failure Mechanism | Root Cause |
+| --- | --- | --- |
+| Actions stuck in `in-progress` for >24 hours | Zombie runner lock | Process killed mid-execution; lock never released |
+| `wp_actionscheduler_logs` > 500 MB / millions of rows | Logging accumulation | Action Scheduler default retention (30 days) too long for high-volume stores |
+| `Deadlock found when trying to get lock` | Row lock contention | High-concurrency workers competing for the same `claim_id` |
+| Past-due count keeps rising, but 0 actions are running | Cron not triggering | WP-Cron disabled or not being hit by visitors / server crontab |
+| Running `wp action-scheduler run` crashes with Fatal OOM | Memory exhaustion | Heavy task (e.g. bulk image optimization or inventory export) exceeding PHP limit |
+
+## Resolution
+
+1. **Clear Stuck Runner Locks (Immediate Unblock)**:
+   Delete the zombie lock transients to allow new workers to claim pending actions:
+
+```bash
+wp db query "DELETE FROM wp_options WHERE option_name LIKE 'action_scheduler_lock_%';"
+```
+
+2. **Reset Stalled `in-progress` Actions to `pending`**:
+   Return orphaned actions back to the queue so they can be processed cleanly:
+
+```sql
+-- Reset actions that have been stuck in-progress for more than 2 hours
+UPDATE wp_actionscheduler_actions 
+SET status = 'pending' 
+WHERE status = 'in-progress' 
+  AND scheduled_date_gmt < DATE_SUB(NOW(), INTERVAL 2 HOUR);
+```
+
+3. **Purge Massive Completed and Canceled Action Logs**:
+   Clear millions of old history logs to drastically restore query speed:
+
+```sql
+-- Delete completed actions older than 7 days
+DELETE FROM wp_actionscheduler_actions 
+WHERE status IN ('complete', 'canceled', 'failed') 
+  AND scheduled_date_gmt < DATE_SUB(NOW(), INTERVAL 7 DAY);
+
+-- Delete orphaned log rows
+DELETE FROM wp_actionscheduler_logs 
+WHERE action_id NOT IN (SELECT action_id FROM wp_actionscheduler_actions);
+```
+
+Optimize the tables after purging:
+```sql
+OPTIMIZE TABLE wp_actionscheduler_actions, wp_actionscheduler_logs, wp_actionscheduler_groups, wp_actionscheduler_claims;
+```
+
+4. **Configure Real High-Frequency Server Crontab**:
+   Offload Action Scheduler from visitor requests to a dedicated 1-minute system cron:
+
+```bash
+# Add to server crontab (crontab -e)
+* * * * * /usr/local/bin/wp action-scheduler run --path=/var/www/html --batch-size=100 > /dev/null 2>&1
+```
+
+5. **Reduce Action Scheduler Log Retention Period**:
+   Prevent future table bloat by reducing the log retention from 30 days to 5 days via an `mu-plugin`:
+
+```php
+<?php
+/**
+ * Plugin Name: Action Scheduler Retention Tuning
+ * Description: Keeps Action Scheduler tables lean by reducing log retention to 5 days.
+ */
+add_filter( 'action_scheduler_retention_period', function() {
+    return 5 * DAY_IN_SECONDS; // 5 days
+} );
+```
+
+## Verification
+
+- Run a dry-run queue worker via WP-CLI and verify pending actions process without errors:
+  ```bash
+  wp action-scheduler run --batch-size=25
+  ```
+- Check **WooCommerce → Status → Scheduled Actions**:
+  Confirm the **In-progress** count is 0 or updating actively, and the **Past-due** count decreases steadily toward 0.
+- Trigger a test order or reset a password:
+  Confirm that transactional notification emails dispatch within 60 seconds.
+- Verify `wp_actionscheduler_actions` table size remains stable under 100 MB.
+
+## Root Cause
+
+Action Scheduler is a database-backed asynchronous priority queue. It uses a cooperative locking strategy where workers claim batches of tasks by updating a `claim_id` column. When long-running external API timeouts or PHP out-of-memory errors terminate workers abruptly, the lock transients in `wp_options` and the `in-progress` states in the actions table are never cleared, causing the queue processor to deadlock and stall all subsequent scheduled events.
+
+## Prevention
+
+- Always decouple Action Scheduler from frontend visitor traffic by utilizing server-level crontab execution.
+- Add database monitoring alerts on `wp_actionscheduler_actions` row counts (>50,000 rows indicates a stalled queue).
+- Set PHP `memory_limit` to at least 512M for CLI/cron contexts to prevent background OOM kills.
+- Ensure all custom plugins using Action Scheduler chunk large datasets into batches under 100 items per action.
+
+## Related Articles
+
+- [/wordpress/cron-not-running](/wordpress/cron-not-running)
+- [/woocommerce/order-emails-not-sending](/woocommerce/order-emails-not-sending)
+- [/woocommerce/checkout-ajax](/woocommerce/checkout-ajax)
+- [/mysql/optimize-tables](/mysql/optimize-tables)
+
+## Official References
+
+- [Action Scheduler: Official Documentation and Architecture](https://actionscheduler.org/)
+- [Action Scheduler: Performance Tuning and High-Volume Stores](https://actionscheduler.org/performance/)
+- [WooCommerce: Managing Scheduled Actions](https://woocommerce.com/document/scheduled-actions-in-woocommerce/)
