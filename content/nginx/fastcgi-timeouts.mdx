@@ -1,0 +1,192 @@
+---
+title: "504 from fastcgi_read_timeout"
+description: "Tuning NGINX fastcgi_read_timeout, FastCGI buffers, and PHP-FPM process pools: resolve upstream gateway timeouts during bulk operations, data imports, and report generation."
+difficulty: Advanced
+timeToFix: "20–60 min"
+appliesTo: [NGINX, PHP-FPM, Hosting]
+tags: [nginx, fastcgi, timeout, php-fpm, hosting]
+severity: High
+updated: 2026-02-15
+featured: false
+---
+
+## Symptoms
+
+- An NGINX server returns `504 Gateway Time-out` after waiting exactly 60 seconds (the default NGINX `fastcgi_read_timeout`).
+- The failure occurs exclusively on heavy administrative workflows: WooCommerce CSV imports, database search-replace plugins, translation file syncing, or XML exports.
+- NGINX error log records: `[error] 14210#14210: *841 upstream timed out (110: Connection timed out) while reading response header from upstream, client: 192.0.2.1, server: example.com, request: "POST /wp-admin/admin-ajax.php HTTP/2.0", upstream: "fastcgi://unix:/run/php/php8.2-fpm.sock:"`.
+- Meanwhile, PHP-FPM may continue executing the script in the background until it hits `max_execution_time`, causing orphan processes or duplicated database writes.
+
+## Possible Causes
+
+1. **Default NGINX FastCGI read timeout**: NGINX defaults to `fastcgi_read_timeout 60s`. If PHP-FPM requires 65 seconds to process a batch of 1,000 products, NGINX severs the connection at second 60.
+2. **FastCGI buffer exhaustion**: Large HTTP responses (such as a 10MB JSON export from the REST API) saturate NGINX's FastCGI response buffers, causing NGINX to buffer to disk or block the socket.
+3. **Mismatched execution limits**: `fastcgi_read_timeout` is shorter than PHP's `max_execution_time` or PHP-FPM's `request_terminate_timeout`.
+4. **PHP-FPM worker thread starvation**: All PHP-FPM children in the pool are busy executing unindexed database queries or slow external API calls, forcing new FastCGI connections to wait in the backlog queue until they timeout.
+5. **Slow database locks blocking PHP execution**: A long-running MySQL transaction locks rows needed by the FastCGI process.
+
+## Prerequisites
+
+- Root or `sudo` shell access to modify `/etc/nginx/` and `/etc/php/` configuration files.
+- Familiarity with reloading NGINX and PHP-FPM services without dropping active connections.
+- Access to NGINX error logs and PHP-FPM slow logs.
+- Active backup of server configuration before modifying system timeouts.
+
+## Investigation
+
+1. **Verify the exact timeout error in the NGINX log**:
+
+```bash
+sudo tail -n 50 /var/log/nginx/error.log | grep -E 'fastcgi_read_timeout|upstream timed out|110: Connection timed out'
+```
+
+2. **Check your current NGINX FastCGI timeout settings**:
+
+```bash
+grep -rn 'fastcgi_read_timeout' /etc/nginx/
+```
+
+3. **Check the corresponding PHP-FPM execution limits**:
+
+```bash
+php -i | grep -E 'max_execution_time|max_input_time|memory_limit'
+grep -rn 'request_terminate_timeout' /etc/php/*/fpm/
+```
+
+4. **Inspect PHP-FPM pool status and queue backlog**:
+   If NGINX cannot even connect to PHP-FPM, check if the listen queue is saturated:
+
+```bash
+# Check if pool is reaching max children
+grep -i 'server reached pm.max_children' /var/log/php*-fpm.log | tail -n 10
+
+# Check socket queue length
+ss -l -x | grep php
+```
+
+::: investigate
+Investigation mindset: Raising `fastcgi_read_timeout` from 60s to 300s is often **a temporary bypass, not a true fix**. Long-running scripts tie up PHP-FPM worker threads for 5 minutes. If 10 administrators run imports simultaneously, all worker processes lock up, bringing down the entire site. Always combine timeout adjustments with background processing.
+:::
+
+## Diagnosis
+
+| Log Signature / Observed Behavior | Underlying Mechanism | Action Required |
+| --- | --- | --- |
+| `upstream timed out (110) while reading response header` | Script running longer than `fastcgi_read_timeout` | Increase FastCGI timeout specifically for the admin location, or offload to CLI |
+| `upstream timed out (110) while connecting to upstream` | PHP-FPM queue full; cannot allocate worker | Raise `pm.max_children` and optimize database/cache |
+| NGINX error: `an upstream response is buffered to a temporary file` | Response larger than `fastcgi_buffers` | Increase `fastcgi_buffers` and `fastcgi_buffer_size` |
+| 504 happens after exactly 60 seconds every time | Default timeout reached | Set explicit `fastcgi_read_timeout 300s;` in NGINX config |
+| NGINX returns 504, but DB record gets created anyway | NGINX disconnected while PHP kept running | Align `request_terminate_timeout` with `fastcgi_read_timeout` |
+
+## Resolution
+
+1. **Tune FastCGI Timeouts and Buffers in NGINX**:
+   Open your site configuration file (e.g., `/etc/nginx/sites-available/example.com`):
+
+```nginx
+location ~ \.php$ {
+    include snippets/fastcgi-php.conf;
+    fastcgi_pass unix:/run/php/php8.2-fpm.sock;
+
+    # Extend timeouts for long-running WordPress execution
+    fastcgi_connect_timeout 60s;
+    fastcgi_send_timeout 300s;
+    fastcgi_read_timeout 300s;
+
+    # Optimal buffer sizing for heavy WordPress admin pages & REST API responses
+    fastcgi_buffer_size 128k;
+    fastcgi_buffers 8 256k;
+    fastcgi_busy_buffers_size 512k;
+    fastcgi_temp_file_write_size 512k;
+}
+```
+
+2. **Isolate Long Timeouts to WP-Admin Only (Recommended Security Best Practice)**:
+   Avoid allowing public visitors to run 300-second long requests. Keep the public site at 60s and only allow 300s inside `/wp-admin/`:
+
+```nginx
+# Public frontend: strict 60s timeout
+location ~ \.php$ {
+    include snippets/fastcgi-php.conf;
+    fastcgi_pass unix:/run/php/php8.2-fpm.sock;
+    fastcgi_read_timeout 60s;
+}
+
+# Administrative area: extended 300s timeout
+location ~ ^/wp-admin/.*\.php$ {
+    include snippets/fastcgi-php.conf;
+    fastcgi_pass unix:/run/php/php8.2-fpm.sock;
+    fastcgi_read_timeout 300s;
+    fastcgi_buffers 8 256k;
+    fastcgi_buffer_size 128k;
+}
+```
+
+3. **Synchronize PHP-FPM Configuration**:
+   Ensure PHP-FPM does not kill the process before NGINX's 300-second mark:
+
+```ini
+; /etc/php/8.2/fpm/pool.d/www.conf
+request_terminate_timeout = 300s
+pm.max_children = 50
+pm.start_servers = 10
+pm.min_spare_servers = 5
+pm.max_spare_servers = 20
+pm.max_requests = 1000
+```
+
+4. **Validate and Reload Services**:
+
+```bash
+# Test NGINX configuration syntax
+sudo nginx -t
+
+# Test PHP-FPM configuration syntax
+sudo php-fpm8.2 -t
+
+# Gracefully reload both services
+sudo systemctl reload nginx
+sudo systemctl restart php8.2-fpm
+```
+
+5. **Offload Batch Jobs to WP-CLI**:
+   For operations exceeding 5 minutes (such as full site search-replace or media regeneration), bypass HTTP and FastCGI entirely:
+
+```bash
+wp search-replace 'http://old.example.com' 'https://new.example.com' --all-tables
+wp import large-export.xml --authors=create
+```
+
+## Verification
+
+- Re-run the long-running operation in WP-Admin and verify it completes without dropping the connection.
+- Monitor active request duration:
+  ```bash
+  tail -f /var/log/nginx/access.log | awk '{print $7, $9, $10, $NF}'
+  ```
+- Verify `/var/log/nginx/error.log` no longer emits `upstream timed out` messages during heavy administrative tasks.
+- Confirm PHP-FPM memory and worker usage remain within healthy parameters (`top` or `htop`).
+
+## Root Cause
+
+`fastcgi_read_timeout` represents the maximum duration NGINX will wait for a FastCGI server (PHP-FPM) to transmit data across the socket. If an unoptimized WordPress query, recursive plugin loop, or bulk data transaction processes data for longer than this directive without writing output to the response stream, NGINX closes the downstream connection and returns HTTP 504.
+
+## Prevention
+
+- Decouple batch processing from user-facing HTTP requests using Action Scheduler or WP-Cron.
+- Implement pagination in custom administrative screens rather than rendering thousands of items at once.
+- Configure Redis object caching to minimize database query times during complex admin queries.
+- Add server alerting on NGINX 504 rates and FastCGI buffer disk writes.
+
+## Related Articles
+
+- [/errors/504-gateway-timeout](/errors/504-gateway-timeout)
+- [/errors/502-bad-gateway](/errors/502-bad-gateway)
+- [/nginx/wordpress-rewrites](/nginx/wordpress-rewrites)
+- [/php/memory-limit](/php/memory-limit)
+
+## Official References
+
+- [NGINX Documentation: fastcgi_read_timeout](https://nginx.org/en/docs/http/ngx_http_fastcgi_module.html#fastcgi_read_timeout)
+- [PHP-FPM: Process Manager Pool Directives](https://www.php.net/manual/en/install.fpm.configuration.php)
+- [WordPress Core: Running Long Tasks with Action Scheduler](https://actionscheduler.org/)
