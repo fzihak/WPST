@@ -70,15 +70,15 @@ wp post list --post_type=post --format=count
 wp db query "SELECT COUNT(*) FROM wp_options WHERE autoload='yes';"
 ```
 
-5. **Decide the strategy** based on engine and severity:
+## Diagnosis
 
-| Scenario | Strategy |
-| --- | --- |
-| MyISAM crashed table | `REPAIR TABLE`, then migrate to InnoDB |
-| InnoDB single-table corrupt | Dump other tables, recreate, reimport |
-| InnoDB tablespace/redo corruption | Restore from backup; file-level recovery is expert territory |
-| Physical storage failing (I/O errors) | Migrate to new storage immediately |
-| Everything checks out but content is wrong | Wrong restore pairing, not corruption |
+| Scenario | Storage Engine | Log Signature / Symptom | Strategy |
+| --- | --- | --- | --- |
+| MyISAM crashed table | MyISAM | `Table is marked as crashed` / error #145 | `REPAIR TABLE`, then migrate to InnoDB |
+| InnoDB single-table corrupt | InnoDB | Page checksum mismatch in error log | Logical rebuild: export data, recreate table, reimport |
+| InnoDB tablespace/redo corruption | InnoDB | Server crash loop on boot, assertion failure | Force recovery mode (`innodb_force_recovery=1..4`) to dump, then restore |
+| Physical storage / I/O fault | Any | OS kernel I/O errors (`dmesg`), sector failure | Snapshot immediately, evacuate to new host/storage |
+| Logical inconsistency (content wrong) | Any | Orphaned rows in `wp_postmeta`, missing terms | SQL cleanup or snapshot rollback (not engine corruption) |
 
 ::: danger
 Never run `REPAIR TABLE` on InnoDB as a "fix" and never delete files in the MySQL data directory to clear an error. Both turn a recoverable problem into data loss. Snapshot first, always.
