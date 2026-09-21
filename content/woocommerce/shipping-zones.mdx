@@ -1,0 +1,174 @@
+---
+title: "Shipping Zones & Calculation Failures"
+description: "Triage WooCommerce shipping calculation issues: fix 'No shipping options were found' errors, postcode wildcard mismatches, shipping zone hierarchy ordering, and cart package splits."
+difficulty: Intermediate
+timeToFix: "15–45 min"
+appliesTo: [WooCommerce, PHP, Shipping]
+tags: [woocommerce, shipping, checkout, rates, zones]
+severity: High
+updated: 2026-02-18
+featured: false
+---
+
+## Symptoms
+
+- Customers on the checkout or cart page see the error message: `"There are no shipping options available. Please ensure that your address has been entered correctly, or contact us if you need any help."`
+- The shipping cost remains `$0.00` or fails to update when a customer switches their shipping country, state, or postal code.
+- Specific regions (e.g., California, London, or specific zip code ranges) fail to match their dedicated shipping methods and fall back to expensive "Rest of the World" rates or no rate at all.
+- Products marked as shippable in the catalog fail to display shipping methods because WooCommerce treats them as virtual items.
+- Adding two different product types into the cart causes shipping calculation to fail completely due to incompatible shipping classes.
+
+## Possible Causes
+
+1. **Incorrect Shipping Zone Hierarchy Ordering**: WooCommerce evaluates shipping zones from top to bottom and stops at the **first matching zone**. If a broad zone (e.g. "United States" or "Europe") is placed above a specific zone (e.g. "California" or "Germany"), the specific zone is never reached.
+2. **Postcode / Zip Code Wildcard and Range Errors**: Formatting errors in postal code ranges (e.g. using `90210-90220` instead of `90210...90220`, or trailing spaces) preventing postcode matching.
+3. **Product Shipping Configuration (Virtual / Missing Weight)**: Products mistakenly marked as **Virtual** (`_virtual = yes`) in product data, or missing dimensions required by live carrier rate calculators (FedEx, USPS, DHL).
+4. **Conflicting Shipping Class Rules**: A shipping method is configured with a cost for "No shipping class", but products with a custom shipping class have empty cost fields, causing the calculation to return `false`.
+5. **Shipping transient caching**: WooCommerce caches calculated shipping packages in transients (`_transient_wc_ship_*`). Stale transients can persist after changing zone rules in admin.
+6. **Geolocation vs Default Customer Location Mismatch**: Under **WooCommerce → Settings → General**, setting Default Customer Location to "Geolocate" fails when reverse proxies or Cloudflare do not pass the `CF-IPCountry` header.
+
+## Prerequisites
+
+- Access to WordPress Administrator dashboard with WooCommerce store management privileges.
+- Access to **WooCommerce → Settings → Shipping → Shipping Zones**.
+- Staging environment or permission to place test orders on production with test shipping addresses.
+- Basic understanding of WooCommerce shipping zone inheritance and shipping class calculation logic.
+
+## Investigation
+
+1. **Enable WooCommerce Shipping Debug Mode**:
+   Bypass the shipping rate transient cache so every checkout address change recalculates rates fresh from the database:
+   - Navigate to **WooCommerce → Status → Tools**.
+   - Check the box for **Shipping debug mode** and save.
+
+2. **Inspect the Shipping Zones Evaluation Order**:
+   - Navigate to **WooCommerce → Settings → Shipping → Shipping Zones**.
+   - Check the numerical drag-and-drop order of your zones.
+   - Verify that **most specific regions** (zip codes, states) are at the top, and **broad regions** (continents, countries) are lower down.
+
+3. **Verify Product Physical vs Virtual Status**:
+   Ensure the items in the cart are not marked as Virtual:
+
+```bash
+# Check if product is marked virtual via WP-CLI
+wp post meta get 1234 _virtual
+```
+
+4. **Test Postcode Range Syntax**:
+   Verify the syntax used in zone postal codes:
+   - Wildcards: `902*` (matches 90210, 90211, etc.)
+   - Ranges: `90210...90220` (must use three dots `...`, not a hyphen `-`)
+   - Fully qualified: One per line, with no trailing spaces or hidden non-printing characters.
+
+5. **Inspect Shipping Logs for Live Carrier APIs**:
+   If using live carrier APIs (FedEx, UPS, Shippo):
+   - Check **WooCommerce → Status → Logs** for `shipping-*.log` or carrier error traces (e.g., invalid API credentials, oversized dimensions, or unserviceable address).
+
+::: investigate
+Investigation mindset: WooCommerce matches shipping zones using a **first-match-wins rule**. Once an address matches a zone in the list, WooCommerce calculates rates *only* from the methods inside that zone and completely ignores all lower zones. Always inspect the zone hierarchy from top to bottom.
+:::
+
+## Diagnosis
+
+| Customer Address / Error Condition | Observed Diagnostic Result | Root Cause |
+| --- | --- | --- |
+| Valid address shows "No shipping options available" | Address matches a broad zone placed above a specific zone | Specific zone placed below broad zone in zone ordering |
+| Postal code `90215` falls back to default zone | Range defined as `90210-90220` | Incorrect range syntax (must use `90210...90220`) |
+| Cart has 2 items; shipping vanishes | One item has a custom shipping class with empty cost | Shipping method has no cost configured for that specific class |
+| Single item in cart shows no shipping | Product data has "Virtual" checkbox checked | Product is set to Virtual; WooCommerce disables shipping calculations |
+| Rates calculate on cart but fail on checkout | Geolocation country does not match user-entered billing address | Geolocation header mismatch or session country override |
+| Live API returns $0.00 or error | Product weight or dimensions missing | Carrier API requires package weight/dimensions to generate quote |
+
+## Resolution
+
+1. **Reorder Shipping Zones (Most Specific to Least Specific)**:
+   In **WooCommerce → Settings → Shipping → Shipping Zones**:
+   - Drag and drop zones so that zip-code-specific zones are at the very top.
+   - State-level or province-level zones in the middle.
+   - Country-wide zones below states.
+   - "Locations not covered by your other zones" remains at the bottom.
+
+2. **Correct Postal Code Range and Wildcard Formatting**:
+   Ensure all postcode lists adhere to WooCommerce formatting rules:
+
+```text
+# Correct formats:
+90210...90220
+SW1A*
+EC1A 1BB
+```
+
+3. **Configure Fallback Shipping Class Costs**:
+   If using shipping classes (e.g., "Bulky Items", "Fragile"):
+   - Open each Flat Rate shipping method.
+   - Ensure every Shipping Class has an explicit formula or cost entered.
+   - Set calculation type: *"Per class: Charge shipping for each shipping class individually"* or *"Per order: Charge shipping for the most expensive shipping class"*.
+
+```text
+# Cost formula examples:
+10.00
+10.00 + ( 2.00 * [qty] )
+```
+
+4. **Verify Physical Product Attributes**:
+   If a product is a physical item, ensure:
+   - **Virtual** is unchecked under **Product Data → General**.
+   - A valid **Weight** and **Dimensions** are entered under **Product Data → Shipping**.
+
+5. **Clear Shipping Rate Caching via WP-CLI**:
+   Purge cached shipping calculation transients across all customer sessions:
+
+```bash
+# Clear all WooCommerce transients
+wp wc tool run clear_transients
+wp db query "DELETE FROM wp_options WHERE option_name LIKE '_transient_wc_ship_%' OR option_name LIKE '_transient_timeout_wc_ship_%';"
+```
+
+6. **Fix Geolocation and Reverse Proxy Headers**:
+   If using Cloudflare, ensure your server configuration passes the country header to PHP:
+
+```php
+// In wp-config.php or an mu-plugin
+if ( isset( $_SERVER['HTTP_CF_IPCOUNTRY'] ) ) {
+    $_SERVER['GEOIP_COUNTRY_CODE'] = $_SERVER['HTTP_CF_IPCOUNTRY'];
+}
+```
+
+## Verification
+
+- Disable **Shipping debug mode** once troubleshooting is complete.
+- Open an incognito browser window and add a physical product to the cart.
+- Test multiple destination addresses:
+  - Specific zip code zone.
+  - Domestic non-specific zone.
+  - International / Rest of World zone.
+- Verify shipping methods display with correct pricing calculations:
+  ```bash
+  curl -sS -X POST "https://example.com/?wc-ajax=update_order_review" \
+    -d "shipping_country=US&shipping_state=CA&shipping_postcode=90210" | grep -o 'shipping_method'
+  ```
+- Confirm the selected shipping method persists cleanly onto the final order record.
+
+## Root Cause
+
+WooCommerce evaluates shipping using a sequential top-down zone matching algorithm combined with shipping class matrices. When store administrators create zones without strictly ordering them from most specific to least specific, when postal code ranges use hyphen delimiters instead of three dots, or when product dimensions are missing for carrier APIs, the matching engine fails to find a valid method and aborts with "No shipping options available".
+
+## Prevention
+
+- Maintain an internal shipping matrix document recording zone priority order.
+- Always test cart calculations whenever introducing a new shipping class or altering carrier rules.
+- Set a universal fallback method in "Locations not covered by your other zones" with a clear message or standard flat rate.
+- Include weight and dimensions validation in your product catalog publishing checklist.
+
+## Related Articles
+
+- [/woocommerce/checkout-broken](/woocommerce/checkout-broken)
+- [/woocommerce/checkout-ajax](/woocommerce/checkout-ajax)
+- [/woocommerce/payment-failed](/woocommerce/payment-failed)
+- [/woocommerce/cart-session-lost](/woocommerce/cart-session-lost)
+
+## Official References
+
+- [WooCommerce: Setting Up Shipping Zones](https://woocommerce.com/document/setting-up-shipping-zones/)
+- [WooCommerce: Product Shipping Classes](https://woocommerce.com/document/product-shipping-classes/)
+- [WooCommerce: Troubleshooting Shipping Rates](https://woocommerce.com/document/troubleshooting-shipping-issues/)
