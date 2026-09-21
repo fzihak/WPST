@@ -1,0 +1,201 @@
+---
+title: "PHP 7.x → 8.x Compatibility & Migration Breakages"
+description: "Diagnosing and fixing breaking changes when upgrading WordPress to PHP 8.1, 8.2, and 8.3: fatal TypeErrors, dynamic property deprecations, removed functions, and regex compatibility checks."
+difficulty: Advanced
+timeToFix: "30–120 min"
+appliesTo: [PHP, WordPress Core, Plugins, Themes]
+tags: [php, php8, deprecation, fatal-error, compatibility]
+severity: High
+updated: 2026-02-15
+featured: true
+---
+
+## Symptoms
+
+- Immediately following a server PHP switch from PHP 7.4 to 8.0, 8.1, 8.2, or 8.3, the site crashes with `500 Internal Server Error` or White Screen of Death.
+- Error logs balloon by gigabytes within hours due to millions of deprecation notices: `"Creation of dynamic property Class::$prop is deprecated in..."`
+- PHP Fatal error: `"Uncaught TypeError: Cannot access offset of type string on string in..."`
+- PHP Fatal error: `"Fatal error: Uncaught TypeError: Unsupported operand types: string + int in..."`
+- Fatal error on legacy plugins: `"Uncaught Error: Call to undefined function each()"` or `"Call to undefined function create_function()"`.
+- Warnings breaking JSON outputs: `"Warning: Attempt to read property on null"` breaking REST API and AJAX endpoints.
+
+## Possible Causes
+
+1. **Strict internal typing in PHP 8.x**: Built-in PHP functions that previously returned `false` or silently coerced types now throw `TypeError` when passed `null` or wrong types (e.g., `strpos()`, `strlen()`, `explode()`).
+2. **Deprecation of dynamic properties (PHP 8.2+)**: Setting undeclared class properties without the `#[\AllowDynamicProperties]` attribute generates noisy deprecation logs on every request.
+3. **Removed legacy functions**: Functions deprecated in PHP 7.x (`each()`, `create_function()`, `money_format()`, `magic_quotes`) are completely removed in PHP 8.0+.
+4. **Stricter string and integer arithmetic**: Non-numeric strings in arithmetic operations (`"10px" + 5`) fatal in PHP 8.0 instead of issuing a warning.
+5. **Array key strictness**: Accessing negative string offsets on arrays or treating strings as multi-dimensional arrays fatal in PHP 8.
+6. **Outdated plugins/themes**: Abandoned commercial or custom plugins whose codebases were never updated for modern PHP syntax.
+
+## Prerequisites
+
+- Staging or local development environment to perform compatibility audits before switching production PHP.
+- WP-CLI access and server shell access to scan codebases and tail logs.
+- Direct access to `wp-config.php` to control error reporting and log routing.
+- Complete snapshot/backup of files and database before running automated search-replace or refactoring scripts.
+
+## Investigation
+
+1. **Audit error logs for exact PHP 8 fatal error signatures**:
+
+```bash
+# Filter for PHP 8 specific fatal signatures
+grep -Ei 'TypeError|undefined function each|undefined function create_function|Unsupported operand' /var/log/php*-fpm.log wp-content/debug.log 2>/dev/null | tail -n 25
+```
+
+2. **Measure log spam caused by PHP 8.2 dynamic property deprecations**:
+
+```bash
+grep -c 'Creation of dynamic property' wp-content/debug.log
+du -sh wp-content/debug.log
+```
+
+3. **Perform static analysis with WP-CLI and PHPCompatibility**:
+   Scan active themes and plugins for PHP 8 compatibility without crashing the site:
+
+```bash
+# Install PHP_CodeSniffer and PHPCompatibility standard via composer or docker
+# Alternatively search for removed PHP functions using ripgrep:
+rg '\b(create_function|each)\s*\(' wp-content/plugins/ wp-content/themes/
+```
+
+4. **Identify which plugin is causing the break**:
+   If the site is down, isolate the offending plugin using the binary search method:
+
+```bash
+wp plugin list --status=active
+# Deactivate suspected legacy plugin
+wp plugin deactivate obsolete-plugin-name
+```
+
+5. **Inspect PHP version configuration in CLI vs FPM**:
+   Verify that your command line PHP matches your web server PHP version:
+
+```bash
+php -v
+php-fpm -v
+```
+
+::: investigate
+Investigation mindset: The vast majority of PHP 8 upgrade crashes come from **abandoned third-party plugins**, not WordPress Core. WordPress 6.4+ officially supports PHP 8.1 and 8.2, and beta-supports 8.3. When an outage occurs, isolate the namespace or file path in the stack trace to determine which plugin needs a patch or replacement.
+:::
+
+## Diagnosis
+
+| Log Error Signature | PHP Version Trigger | Mechanism | Remediation |
+| --- | --- | --- | --- |
+| `Fatal error: Uncaught TypeError: Cannot access offset of type string on string` | PHP 8.0+ | Code treated a string as an array or accessed nested key on string | Type-check variable with `is_array()` before indexing |
+| `Uncaught Error: Call to undefined function each()` | PHP 8.0+ | Legacy function `each()` removed | Replace with standard `foreach()` loop |
+| `Uncaught Error: Call to undefined function create_function()` | PHP 8.0+ | `create_function()` removed | Refactor to anonymous function / closure: `function() { ... }` |
+| `Deprecated: Creation of dynamic property Class::$var` | PHP 8.2+ | Class property assigned without explicit declaration | Declare property in class or add `#[\AllowDynamicProperties]` |
+| `Fatal error: Uncaught TypeError: strpos(): Passing null to parameter #1` | PHP 8.1+ | Passing `null` to non-nullable internal function | Pass default empty string: `strpos( (string) $val, ... )` |
+| `Unsupported operand types: string + int` | PHP 8.0+ | Arithmetic on non-numeric string | Cast to int or sanitize with `floatval()` / `intval()` |
+
+## Resolution
+
+1. **Suppress Deprecation Log Flood in Production (Immediate IOPS Relief)**:
+   If dynamic property notices are filling your disk before you can patch every plugin, filter deprecation notices from `debug.log`:
+
+```php
+// In wp-config.php (above the "stop editing" line)
+@ini_set( 'display_errors', '0' );
+@ini_set( 'log_errors', '1' );
+// Log errors and fatals only, ignore deprecations and notices:
+error_reporting( E_ALL & ~E_NOTICE & ~E_DEPRECATED & ~E_USER_DEPRECATED );
+```
+
+2. **Patch `each()` function removals**:
+   Replace legacy `each()` loops in old custom code:
+
+```php
+// Old PHP 7 syntax (FATAL in PHP 8):
+// while ( list( $key, $val ) = each( $array ) ) { ... }
+
+// Refactored PHP 8 compatible syntax:
+foreach ( $array as $key => $val ) {
+    // preserve logic
+}
+```
+
+3. **Patch `create_function()` removals**:
+   Replace anonymous code evaluation with native closures:
+
+```php
+// Old PHP 7 syntax (FATAL in PHP 8):
+// add_action( 'init', create_function( '', 'return custom_function();' ) );
+
+// Refactored PHP 8 compatible syntax:
+add_action( 'init', function() {
+    return custom_function();
+} );
+```
+
+4. **Address PHP 8.2 Dynamic Property Notices in Custom Classes**:
+   Add the attribute or declare the property explicitly:
+
+```php
+// Option A: Declare property explicitly
+class Custom_Plugin_Worker {
+    public $user_id;
+    public $settings;
+}
+
+// Option B: Allow dynamic properties across the entire class (PHP 8.2+)
+#[\AllowDynamicProperties]
+class Legacy_Bridge_Handler {
+    // allows dynamic property creation without notices
+}
+```
+
+5. **Guard Against Strict Type Null Parameters**:
+   Wrap legacy arguments with type casting before passing to native PHP string/array helpers:
+
+```php
+// Prevents TypeError: Passing null to parameter #1
+$length = strlen( (string) $unvalidated_string );
+$clean  = trim( (string) $maybe_null_input );
+```
+
+6. **Roll back safely if a mission-critical commercial plugin has no PHP 8 update**:
+   If a core revenue plugin (e.g., custom payment gateway) fails and cannot be instantly patched:
+   - Temporarily switch the hosting panel back to PHP 8.0 or 7.4.
+   - Contact the plugin vendor or build a containerized migration branch.
+
+## Verification
+
+- Browse key workflows: Homepage, WooCommerce checkout, admin post publishing, and user profile saves.
+- Verify `debug.log` remains clean of `TypeError` and `Uncaught Error` exceptions.
+- Validate REST API and AJAX endpoints return valid JSON without PHP warning prefixes:
+  ```bash
+  curl -sI https://example.com/wp-json/ | head -5
+  ```
+- Run WP-CLI core and plugin status checks:
+  ```bash
+  wp core check-update
+  wp plugin list
+  ```
+
+## Root Cause
+
+PHP 8.0–8.3 transformed PHP from an extremely lenient, loosely typed language into a modern engine with strict type checking, engine-level exceptions, and aggressive deprecation schedules. Code written in the PHP 5.x and 7.x era relied heavily on silent type coercion and deprecated evaluation functions (`create_function`, `each`). When executed on PHP 8+, warnings become fatal TypeErrors, and unhandled exceptions abort execution.
+
+## Prevention
+
+- Always test major PHP upgrades on a staging environment that mirrors production plugins and data.
+- Run static analysis tools like `PHPCompatibilityWP` during CI/CD pipelines before deployment.
+- Decommission abandoned plugins that have not received an update in more than 12 months.
+- Configure `error_reporting` in production to filter `E_DEPRECATED` while maintaining strict error tracking in staging.
+
+## Related Articles
+
+- [/errors/critical-error](/errors/critical-error)
+- [/errors/500-internal-server-error](/errors/500-internal-server-error)
+- [/plugins/plugin-fatal-error](/plugins/plugin-fatal-error)
+- [/php/memory-limit](/php/memory-limit)
+
+## Official References
+
+- [PHP.net: Migrating from PHP 7.4.x to PHP 8.0.x](https://www.php.net/manual/en/migration80.php)
+- [PHP.net: Deprecated Features in PHP 8.2](https://www.php.net/manual/en/migration82.deprecated.php)
+- [WordPress Core: PHP Compatibility and WordPress Versions](https://make.wordpress.org/core/handbook/references/php-compatibility-and-wordpress-versions/)
