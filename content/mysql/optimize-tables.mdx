@@ -1,0 +1,220 @@
+---
+title: "Database Optimization, Autoload Bloat & Table Cleanup"
+description: "Shrink bloated wp_options autoload data, purge expired transients, remove orphaned postmeta rows, and resolve MySQL InnoDB storage fragmentation."
+difficulty: Intermediate
+timeToFix: "20–60 min"
+appliesTo: [Database, MySQL, MariaDB, Hosting, Performance]
+tags: [mysql, database, autoload, performance, cleanup, optimize]
+severity: High
+updated: 2026-02-18
+featured: true
+---
+
+## Symptoms
+
+- PHP memory exhaustion errors (`Fatal error: Allowed memory size of ... bytes exhausted`) occurring immediately during the initial WordPress bootstrap (`wp-settings.php`), even on lightweight static pages.
+- Time to First Byte (TTFB) is slow across the entire site because MySQL takes hundreds of milliseconds simply running `SELECT option_name, option_value FROM wp_options WHERE autoload = 'yes'`.
+- The database storage size exceeds multiple gigabytes, even though the site only has a few hundred posts and products.
+- Database backups (`mysqldump`) and staging clones take hours to finish or abort with timeout and buffer errors.
+- Table fragmentation reported in phpMyAdmin or database health checks: Data Free space constitutes 50%+ of total table size.
+
+## Possible Causes
+
+1. **Autoloaded options bloat (`autoload='yes'`)**: Plugins saving large serialized data objects, transient caches, tracking logs, or API responses into `wp_options` with autoload enabled by default (often totaling 5MB to 50MB+).
+2. **Accumulated expired transients**: Thousands or millions of obsolete `_transient_*` and `_transient_timeout_*` rows abandoned in `wp_options` because no persistent object cache is active to manage automatic TTL expiration.
+3. **Orphaned metadata rows**: Deleting posts, products, users, or WooCommerce orders leaves millions of disconnected metadata rows in `wp_postmeta`, `wp_usermeta`, `wp_commentmeta`, and `wp_termmeta`.
+4. **Action Scheduler and logging tables**: Millions of completed or failed task logs in `wp_actionscheduler_logs`, `wp_woocommerce_downloadable_product_permissions`, or redirect tracking tables.
+5. **InnoDB tablespace fragmentation**: Frequent `UPDATE` and `DELETE` operations create empty holes in the `.ibd` tablespace files on disk that MySQL cannot reclaim without a table rebuild.
+
+## Prerequisites
+
+- Access to MySQL command line (`mysql` CLI) or phpMyAdmin.
+- Shell access with WP-CLI installed.
+- **Mandatory full database backup** taken immediately prior to executing any manual `DELETE` or `OPTIMIZE` commands.
+- Scheduled maintenance window or low-traffic period to prevent transaction lock contention.
+
+## Investigation
+
+1. **Calculate the total size of autoloaded options in `wp_options`**:
+   The recommended healthy maximum for autoloaded data is **under 800 KB**. Anything above 2 MB causes measurable performance degradation:
+
+```sql
+SELECT 
+    ROUND(SUM(LENGTH(option_value)) / 1024 / 1024, 2) AS "Autoload_Size_MB",
+    COUNT(*) AS "Total_Autoload_Rows"
+FROM wp_options 
+WHERE autoload = 'yes';
+```
+
+2. **Identify the top 20 largest autoloaded options**:
+   Find the exact plugin options consuming the most memory:
+
+```sql
+SELECT option_name, 
+       LENGTH(option_value) AS "Size_Bytes", 
+       ROUND(LENGTH(option_value) / 1024, 2) AS "Size_KB"
+FROM wp_options 
+WHERE autoload = 'yes' 
+ORDER BY LENGTH(option_value) DESC 
+LIMIT 20;
+```
+
+3. **Count expired transients in `wp_options`**:
+
+```sql
+SELECT COUNT(*) AS "Expired_Transients_Count"
+FROM wp_options 
+WHERE option_name LIKE '_transient_timeout_%' 
+  AND option_value < UNIX_TIMESTAMP();
+```
+
+4. **Identify orphaned postmeta rows**:
+   Count rows in `wp_postmeta` that reference non-existent post IDs:
+
+```sql
+SELECT COUNT(*) AS "Orphaned_Postmeta_Rows"
+FROM wp_postmeta pm 
+LEFT JOIN wp_posts p ON pm.post_id = p.ID 
+WHERE p.ID IS NULL;
+```
+
+5. **Measure InnoDB storage overhead (Fragmentation)**:
+   List tables with the highest unused disk space (`DATA_FREE`):
+
+```sql
+SELECT TABLE_NAME, 
+       ROUND(DATA_LENGTH / 1024 / 1024, 2) AS "Data_MB",
+       ROUND(INDEX_LENGTH / 1024 / 1024, 2) AS "Index_MB",
+       ROUND(DATA_FREE / 1024 / 1024, 2) AS "Fragmented_Free_MB"
+FROM information_schema.TABLES
+WHERE TABLE_SCHEMA = DATABASE() 
+  AND DATA_FREE > 10 * 1024 * 1024
+ORDER BY DATA_FREE DESC;
+```
+
+::: investigate
+Investigation mindset: WordPress executes `SELECT ... WHERE autoload = 'yes'` on **every single request** before anything else runs. If your autoload size is 15 MB, PHP allocates and parses 15 MB of memory for *every page view*, immediately killing worker concurrency and spiking server RAM usage.
+:::
+
+## Diagnosis
+
+| Diagnostic Query Result | Failure Mechanism | Remediation Target |
+| --- | --- | --- |
+| Autoload size > 2.0 MB | Autoload Bloat | Disable autoload on large transients, cache objects, and logs |
+| Expired transients count > 10,000 | Transient Abandonment | Purge expired transients via WP-CLI; install Redis object cache |
+| Orphaned postmeta count > 50,000 | Incomplete Deletion | Delete unreferenced postmeta rows safely |
+| `wp_actionscheduler_logs` > 500 MB | Task Log Accumulation | Purge completed actions older than 7 days |
+| `DATA_FREE` > 50% of table size | InnoDB Fragmentation | Run `OPTIMIZE TABLE` to reclaim storage back to the OS filesystem |
+
+## Resolution
+
+1. **Create an Immediate Database Snapshot**:
+   Never clean or optimize a live database without an explicit snapshot:
+
+```bash
+wp db export pre-cleanup-backup.sql
+```
+
+2. **Fix Autoload Bloat by Disabling Autoload on Heavy Keys**:
+   Options that do not need to load on every frontend page request (e.g. plugin update caches, log entries, reporting data) should be set to `autoload = 'no'` (or `autoload = 'off'` in WP 6.6+):
+
+```sql
+-- Disable autoload for specific identified heavy plugin options
+UPDATE wp_options 
+SET autoload = 'no' 
+WHERE option_name IN (
+    'heavy_plugin_cache_data',
+    'abandoned_extension_analytics',
+    'cron_debug_log'
+);
+```
+
+3. **Purge Expired Transients Safely**:
+   Use WP-CLI to delete all expired transient rows from `wp_options`:
+
+```bash
+# Delete expired transients
+wp transient delete --expired
+
+# Clean remaining all transients safely (will regenerate on demand)
+wp transient delete --all
+```
+
+4. **Delete Orphaned Postmeta and Termmeta**:
+   Remove unreferenced meta rows left behind by deleted plugins and posts:
+
+```bash
+# Purge orphaned postmeta using WP-CLI
+wp db query "DELETE pm FROM wp_postmeta pm LEFT JOIN wp_posts p ON pm.post_id = p.ID WHERE p.ID IS NULL;"
+
+# Purge orphaned termmeta
+wp db query "DELETE tm FROM wp_termmeta tm LEFT JOIN wp_terms t ON tm.term_id = t.term_id WHERE t.term_id IS NULL;"
+
+# Purge post revisions older than 30 days
+wp post delete $(wp post list --post_type='revision' --format=ids) --force
+```
+
+5. **Reclaim Disk Space and Rebuild InnoDB Tablespace**:
+   Reclaim fragmented disk space back to the operating system:
+
+```sql
+-- In MySQL (rebuilds the table and frees unused space)
+OPTIMIZE TABLE wp_options, wp_posts, wp_postmeta, wp_comments, wp_commentmeta;
+```
+
+Or via WP-CLI:
+```bash
+wp db optimize
+```
+
+6. **Limit Post Revisions Permanently in `wp-config.php`**:
+   Prevent future database growth from infinite post revisions:
+
+```php
+// Limit post revisions to 5 per post
+define( 'WP_POST_REVISIONS', 5 );
+
+// Empty trash automatically every 7 days
+define( 'EMPTY_TRASH_DAYS', 7 );
+```
+
+## Verification
+
+- Re-calculate the autoloaded options size:
+  ```bash
+  wp db query "SELECT ROUND(SUM(LENGTH(option_value)) / 1024, 2) AS 'Autoload_KB' FROM wp_options WHERE autoload = 'yes';"
+  ```
+  Confirm the value is **under 1,000 KB**.
+- Verify frontend page response:
+  Measure TTFB improvement with `curl`:
+  ```bash
+  curl -sS -o /dev/null -w 'TTFB: %{time_starttransfer}s\n' https://example.com/
+  ```
+- Run table integrity check:
+  ```bash
+  wp db check
+  ```
+
+## Root Cause
+
+WordPress is designed with extensible key-value storage schemas (`wp_options` and `wp_postmeta`). When third-party plugins write transient data, log traces, or large serialized arrays into `wp_options` with the default `autoload = 'yes'` flag, MySQL must read and transmit the entire dataset on every PHP request. Furthermore, MySQL InnoDB tables do not automatically shrink on disk when rows are deleted, resulting in severe storage fragmentation until a table rebuild is executed.
+
+## Prevention
+
+- Audit `wp_options` autoload size on a quarterly basis.
+- Deploy a persistent object cache (Redis / Memcached) so transients are stored in memory rather than written to the database.
+- Cap `WP_POST_REVISIONS` to 5 in `wp-config.php` across all environments.
+- Remove deactivated plugins and run database cleanups before and after major site migrations.
+
+## Related Articles
+
+- [/mysql/database-repair](/mysql/database-repair)
+- [/mysql/search-replace](/mysql/search-replace)
+- [/performance/object-cache](/performance/object-cache)
+- [/errors/allowed-memory-size-exhausted](/errors/allowed-memory-size-exhausted)
+
+## Official References
+
+- [WordPress Developer: Options API and Autoload Behavior](https://developer.wordpress.org/apis/options/)
+- [MySQL 8.0 Reference: OPTIMIZE TABLE Statement](https://dev.mysql.com/doc/refman/8.0/en/optimize-table.html)
+- [WP-CLI: wp db optimize Command Reference](https://developer.wordpress.org/cli/commands/db/optimize/)
