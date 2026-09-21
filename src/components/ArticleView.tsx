@@ -10,7 +10,7 @@ import { Icon } from "@/components/Icon";
 import { Badge, DifficultyPip, SeverityBadge, Tag } from "@/components/ui";
 import { cn } from "@/utils/cn";
 
-const REPO = "https://github.com/wp-support-lab/wordpress-support-toolkit";
+const REPO = "https://github.com/fzihak/WPST";
 
 function ReadingProgress() {
   const [pct, setPct] = useState(0);
