@@ -1,0 +1,188 @@
+---
+title: "Site Health Status & Critical Alerts"
+description: "Investigate and resolve critical Site Health alerts in WordPress: loopback request failures, blocked REST API, disabled background updates, missing PHP modules, and persistent object cache warnings."
+difficulty: Intermediate
+timeToFix: "15–45 min"
+appliesTo: [WordPress Core, Hosting, PHP, REST API]
+tags: [site-health, debug, loopback, rest-api, core]
+severity: High
+updated: 2026-02-15
+featured: true
+---
+
+## Symptoms
+
+- Navigating to **Tools → Site Health** shows critical alert badges: `"The REST API encountered an error"`, `"Your site could not complete a loopback request"`, or `"Background updates are not working as expected"`.
+- Gutenberg block editor fails to publish posts, showing `"Publishing failed. The response is not a valid JSON response."`
+- Scheduled posts are marked `"Missed schedule"` because loopback WP-Cron requests cannot connect to the origin.
+- Site Health recommendations warn: `"One or more recommended modules are missing"` (`curl`, `intl`, `imagick`, `zip`, or `sodium`).
+- Notice: `"A persistent object cache is not being used"` on high-traffic sites causing excessive database queries.
+
+## Possible Causes
+
+1. **Loopback connection failure (cURL error 28 / 7)**: The server cannot connect back to its own domain due to DNS resolution failure, firewall loopback restrictions, or local hosts file omissions.
+2. **REST API blocked or intercepted**: Security plugins, basic authentication, Cloudflare WAF, or `.htaccess` rewrite rules blocking `/wp-json/`.
+3. **Missing critical PHP extensions**: PHP compiled without modern core extensions (`intl`, `imagick`, `mbstring`, `zip`, `bcmath`).
+4. **Disabled background updates**: Constants like `AUTOMATIC_UPDATER_DISABLED` or `DISALLOW_FILE_MODS` defined in `wp-config.php`, or Git repository tracking webroot.
+5. **SSL certificate mismatch on loopback**: Local cURL trust store does not contain the CA certificate, or self-signed staging certificates fail peer verification.
+6. **Object caching unavailable**: No Redis or Memcached daemon running or PECL extension missing.
+
+## Prerequisites
+
+- Access to WordPress Administrator dashboard.
+- SSH or terminal access to run WP-CLI commands and test local networking.
+- Ability to edit `wp-config.php` and server configuration files.
+- Basic understanding of server DNS and loopback networking (`/etc/hosts`).
+
+## Investigation
+
+1. **Run the Site Health audit via WP-CLI**:
+
+```bash
+wp site health check
+wp site health check --listen
+```
+
+2. **Test loopback cURL connectivity directly from the server**:
+   Verify if the server can reach its own domain name without timing out or failing SSL verification.
+
+```bash
+# Test loopback connection
+curl -Iv https://example.com/wp-json/
+
+# Inspect response status and cURL error codes
+curl -sS -o /dev/null -w 'HTTP Status: %{http_code} | Total: %{time_total}s\n' https://example.com/wp-json/
+```
+
+3. **Check DNS resolution on the local server**:
+   Verify what IP address `example.com` resolves to from within the host machine:
+
+```bash
+getent hosts example.com
+dig +short example.com
+```
+
+4. **Audit active `wp-config.php` update and debug flags**:
+
+```bash
+wp config get AUTOMATIC_UPDATER_DISABLED
+wp config get DISALLOW_FILE_MODS
+wp config get WP_HTTP_BLOCK_EXTERNAL
+```
+
+5. **List loaded PHP modules**:
+   Check if required or recommended modules are loaded:
+
+```bash
+php -m | grep -E 'curl|intl|imagick|zip|mbstring|sodium|bcmath'
+```
+
+::: investigate
+Investigation mindset: The two most common Site Health failures—**REST API error** and **Loopback failure**—are almost always the *same underlying network problem*. When WordPress performs a loopback request, the server is calling *itself* over HTTPS. If the firewall drops outbound connections to the server's own public IP, both checks fail instantly.
+:::
+
+## Diagnosis
+
+| Site Health Alert | Diagnostic Test Result | Root Cause |
+| --- | --- | --- |
+| "Your site could not complete a loopback request" | `curl https://example.com/` returns cURL error 28 (timeout) | Firewall/NAT hairpinning blocks server from connecting to its own public IP |
+| "The REST API encountered an error" | `/wp-json/` returns HTTP 401 or 403 | Basic auth active, Cloudflare bot fight mode, or security plugin blocking REST |
+| "cURL error 60: SSL certificate problem" | cURL fails peer verification | Server CA trust store outdated, or self-signed cert on staging |
+| "Background updates are not working" | `DISALLOW_FILE_MODS` is true | File modification disabled in `wp-config.php` or `.git` directory present |
+| "One or more recommended modules are missing: intl" | `php -m` lacks `intl` | Internationalization extension not installed in PHP runtime |
+| "A persistent object cache is not being used" | Redis/Memcached missing | No in-memory cache daemon running to store transients and query results |
+
+## Resolution
+
+1. **Fix Server Loopback DNS via `/etc/hosts` (Fixes Loopback & REST API errors)**:
+   If your server firewall or cloud NAT blocks loopback traffic to your public IP, map your domain to `127.0.0.1` locally:
+
+```bash
+# Add domain to /etc/hosts
+sudo sh -c 'echo "127.0.0.1 example.com" >> /etc/hosts'
+
+# Test loopback again
+curl -sI https://example.com/wp-json/ | head -5
+```
+
+2. **Fix SSL CA Certificate Store (Resolves cURL Error 60)**:
+   If cURL cannot verify the SSL certificate during loopback:
+
+```bash
+# Ubuntu / Debian
+sudo apt update && sudo apt install --reinstall ca-certificates -y
+sudo update-ca-certificates
+
+# RHEL / AlmaLinux
+sudo yum reinstall ca-certificates -y
+sudo update-ca-trust
+```
+
+3. **Install Missing Recommended PHP Extensions**:
+   Install missing extensions for modern image handling, internationalization, and compression:
+
+```bash
+# For PHP 8.2 on Debian/Ubuntu
+sudo apt install php8.2-intl php8.2-imagick php8.2-zip php8.2-bcmath php8.2-mbstring -y
+sudo systemctl restart php8.2-fpm
+```
+
+4. **Resolve Background Update Restrictions**:
+   Check `wp-config.php` and remove conflicting overrides:
+
+```php
+// Remove or set to false to re-enable core background security updates:
+define( 'AUTOMATIC_UPDATER_DISABLED', false );
+
+// If DISALLOW_FILE_MODS is needed for security, note that it deliberately disables updates:
+// define( 'DISALLOW_FILE_MODS', true );
+```
+
+5. **Whitelist REST API in Security Plugins / Cloudflare**:
+   - In Cloudflare WAF: Add an exception rule for URI Path containing `/wp-json/`.
+   - If using HTTP Basic Auth on staging: Allow loopback requests from `127.0.0.1` without password prompts in Apache/NGINX.
+
+6. **Implement Persistent Object Cache (Redis)**:
+   Install Redis server and the Redis Object Cache plugin:
+
+```bash
+sudo apt install redis-server php8.2-redis -y
+sudo systemctl enable --now redis-server
+wp plugin install redis-cache --activate
+wp redis enable
+```
+
+## Verification
+
+- Return to **WP-Admin → Tools → Site Health**:
+  Confirm the status badge reports `"Good"` or `"Great"`.
+- Ensure critical alerts for REST API and Loopback requests have vanished.
+- Test Gutenberg editor: Create and publish a draft post to confirm zero JSON parsing errors.
+- Run automated CLI verification:
+  ```bash
+  wp site health check
+  ```
+
+## Root Cause
+
+Site Health tests synthetic workflows that modern WordPress requires to function: asynchronous cron processing, REST API-driven block editing, and self-diagnostics. These workflows require the web server to act as both a **server** and a **client** simultaneously. When server-level security rules, outdated CA certificates, or network NAT routing prevent the server from accessing its own hostname, Site Health flags critical system degradation.
+
+## Prevention
+
+- Include loopback domain mappings in `/etc/hosts` in your automated server deployment scripts (Ansible, Terraform).
+- Maintain automated OS package updates to ensure CA trust stores stay fresh.
+- Always test staging basic authentication setups to ensure background cron and loopbacks are exempted.
+- Monitor Site Health status programmatically via WP-CLI on production environments.
+
+## Related Articles
+
+- [/wordpress/rest-api-blocked](/wordpress/rest-api-blocked)
+- [/wordpress/cron-not-running](/wordpress/cron-not-running)
+- [/performance/object-cache](/performance/object-cache)
+- [/errors/ssl-handshake-failed](/errors/ssl-handshake-failed)
+
+## Official References
+
+- [WordPress Developer: Site Health Tool Documentation](https://developer.wordpress.org/advanced-administration/security/site-health/)
+- [WordPress Core: Server Environment Recommendations](https://developer.wordpress.org/advanced-administration/before-install/server-requirements/)
+- [cURL: SSL Certificate Verification (Error 60)](https://curl.se/docs/sslcerts.html)
