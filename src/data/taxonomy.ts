@@ -105,6 +105,7 @@ export const SECTIONS: Section[] = [
       { label: "Shipping zones misapplied", slug: "/woocommerce/shipping-zones" },
       { label: "Coupons rejected", slug: "/woocommerce/coupons" },
       { label: "Checkout AJAX / HPOS issues", slug: "/woocommerce/checkout-ajax" },
+      { label: "Action Scheduler queue stuck", slug: "/woocommerce/action-scheduler-stuck" },
     ],
   },
   {
