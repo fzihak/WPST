@@ -1,0 +1,191 @@
+---
+title: "Query Monitor Profiling & Bottleneck Isolation"
+description: "Diagnosing slow database queries, duplicate queries, excessive object cache misses, and hanging external HTTP API requests using Query Monitor."
+difficulty: Intermediate
+timeToFix: "20–60 min"
+appliesTo: [Performance, Database, PHP, Plugins, Themes]
+tags: [query-monitor, performance, slow-query, debug, profiling]
+severity: Medium
+updated: 2026-02-18
+featured: true
+---
+
+## Symptoms
+
+- Time to First Byte (TTFB) exceeds 1.5 seconds on uncached or authenticated requests (logged-in admins, WooCommerce checkout, membership portals).
+- Database CPU spikes to 100% on MySQL/MariaDB server during moderate concurrent traffic.
+- A single page request generates hundreds or thousands of SQL database queries (`>500 queries`).
+- Sporadic HTTP 504 gateway timeouts on archive pages or product catalog filters.
+- Admin screens take 10+ seconds to load, with no obvious fatal error or server log exception.
+
+## Possible Causes
+
+1. **N+1 Query Loops**: A plugin or custom theme loop executes an individual SQL query inside a `foreach` loop (e.g., querying post meta or author details separately for every item in a 100-post list) instead of batch-fetching with `update_postmeta_cache()`.
+2. **Slow, unindexed queries**: Custom post types or plugins querying `wp_postmeta` with complex `LIKE '%...%'` conditions or sorting by unindexed `meta_value`, resulting in full table scans.
+3. **Synchronous external HTTP API calls**: A plugin executes an outbound API call (`wp_remote_get()` to a licensing server, CRM, or shipping API) during the main page render thread without caching the response.
+4. **Duplicate queries**: The same exact SQL query is dispatched multiple times during a single page load because the result is not stored in an in-memory runtime variable or persistent object cache.
+5. **Autoloaded options overload**: Core and plugins executing repeated queries to update or fetch bloated `wp_options` records.
+6. **Heavy theme action hooks**: Complex custom functions hooked into `init`, `wp_head`, or `the_content` executing heavy calculations on every request.
+
+## Prerequisites
+
+- Access to WordPress Administrator dashboard.
+- Query Monitor plugin installed (or permission to install via WP-CLI).
+- Staging environment preferred for deep profiling; if profiling on production, restrict Query Monitor viewing to administrator accounts or authenticated cookies.
+- Understanding of SQL `EXPLAIN` and basic WordPress database schema (`wp_posts`, `wp_postmeta`, `wp_options`).
+
+## Investigation
+
+1. **Install and activate Query Monitor safely**:
+
+```bash
+# Install Query Monitor via WP-CLI
+wp plugin install query-monitor --activate
+
+# Restrict viewing permissions (Production Safety)
+# Set QM viewing cookie so visitors never see debug panels:
+# In WP-Admin -> Settings -> Query Monitor
+```
+
+2. **Enable query tracking constants in `wp-config.php`**:
+   Ensure `SAVEQUERIES` is enabled temporarily so Query Monitor can capture the full call stack for every database query:
+
+```php
+// In wp-config.php (remove or disable after investigation closes)
+define( 'SAVEQUERIES', true );
+```
+
+3. **Inspect the Top-Level Metrics Bar**:
+   Load the slow page as an administrator. Look at the admin toolbar summary:
+   - **Page Generation Time**: Target is `< 0.5s`. If `> 1.5s`, investigate components.
+   - **Peak Memory Usage**: If `> 64MB` on a simple page, a heavy plugin is loading entire datasets into RAM.
+   - **Database Queries**: Target is `< 75 queries`. If `> 250 queries`, check for N+1 loops.
+   - **Database Query Time**: If query time constitutes >50% of total page time, the database is the primary bottleneck.
+
+4. **Filter Queries by Component**:
+   Open Query Monitor panel → **Database Queries** → **Queries by Component**:
+   Identify which specific plugin (e.g., `plugin-name`, `core`, `theme`) accounts for the largest proportion of query count and execution time.
+
+5. **Examine the "Duplicate Queries" Tab**:
+   Click **Duplicate Queries** to see queries running 10, 50, or 100 times per request.
+
+6. **Check the "HTTP API Calls" Tab**:
+   Inspect external requests. Look for outbound requests with `Time > 0.5s` or HTTP response codes `4xx/5xx` that block the page render.
+
+::: investigate
+Investigation mindset: Query Monitor doesn't just show *that* a query is slow—it provides the **exact PHP call stack** that called it. Click the component or caller name to see the exact file and line number (`my-plugin/includes/class-frontend.php:142`) responsible for dispatching the query.
+:::
+
+## Diagnosis
+
+| Query Monitor Indicator | Failure Mechanism | Root Cause |
+| --- | --- | --- |
+| Duplicate Queries: 50+ identical `SELECT * FROM wp_postmeta WHERE post_id = ...` | N+1 Query Loop | Template iterating through items without warming the postmeta cache |
+| Slow Query: `SELECT ... FROM wp_postmeta WHERE meta_key = '...' AND meta_value LIKE '%...'` | Full Table Scan | Unindexed search query on large `wp_postmeta` table |
+| HTTP API Calls: `wp_remote_get()` taking 2.8 seconds | Synchronous External Call | Outbound licensing or currency conversion API executed on page render |
+| Database Queries > 1000 on product category page | Unbounded Query | Filter or faceted search query without `LIMIT` or pagination |
+| Object Cache: High query count, 0% hit ratio | Cache Inactive | Persistent object cache (Redis/Memcached) not installed or disconnected |
+
+## Resolution
+
+1. **Resolve N+1 Query Loops with Cache Warming**:
+   If a custom template or plugin fetches metadata inside a loop, prime the cache beforehand using core WordPress helper functions:
+
+```php
+// Bad: Queries database 50 times in a loop
+foreach ( $post_ids as $id ) {
+    $price = get_post_meta( $id, '_custom_price', true );
+}
+
+// Good: Primes all postmeta for all IDs in a single SQL query
+update_postmeta_cache( $post_ids );
+foreach ( $post_ids as $id ) {
+    $price = get_post_meta( $id, '_custom_price', true ); // Served instantly from memory
+}
+```
+
+2. **Cache Expensive SQL Query Results with Transients**:
+   If a query aggregates data (e.g., counting reviews, calculating total sales) and takes >100ms:
+
+```php
+function get_expensive_custom_report() {
+    $cache_key = 'my_custom_report_data';
+    $data = get_transient( $cache_key );
+
+    if ( false === $data ) {
+        global $wpdb;
+        $data = $wpdb->get_results( "SELECT ... heavy aggregate query ..." );
+        // Cache result for 6 hours
+        set_transient( $cache_key, $data, 6 * HOUR_IN_SECONDS );
+    }
+
+    return $data;
+}
+```
+
+3. **Asynchronously Offload or Cache External HTTP API Calls**:
+   Never run external API checks synchronously on frontend page requests:
+   - Cache API responses in transients with a reasonable expiration (e.g., 12 hours).
+   - Move external sync calls to a background scheduled task using Action Scheduler.
+
+4. **Add Indexes to Custom Tables**:
+   If Query Monitor reports slow queries on custom plugin tables without indexes:
+
+```sql
+-- Analyze query execution plan
+EXPLAIN SELECT * FROM wp_custom_table WHERE user_id = 42 AND status = 'active';
+
+-- Add composite index if full table scan is reported
+ALTER TABLE wp_custom_table ADD INDEX idx_user_status (user_id, status);
+```
+
+5. **Implement Persistent Object Caching (Redis)**:
+   Turn repetitive queries into microsecond memory lookups:
+
+```bash
+wp plugin install redis-cache --activate
+wp redis enable
+```
+
+6. **Clean up After Troubleshooting**:
+   Once optimization is complete, disable `SAVEQUERIES` in `wp-config.php` to save server memory:
+
+```php
+define( 'SAVEQUERIES', false );
+```
+
+## Verification
+
+- Re-load the profiled page and verify Query Monitor toolbar metrics:
+  - **Database Queries**: Reduced by 50–80%.
+  - **Duplicate Queries**: Reduced to near zero.
+  - **HTTP API Calls**: 0 external calls executed on frontend page load.
+  - **Page Generation Time**: Drops under 500ms.
+- Run a benchmark comparison using `curl`:
+  ```bash
+  curl -sS -o /dev/null -w 'TTFB: %{time_starttransfer}s | Total: %{time_total}s\n' https://example.com/slow-page/
+  ```
+
+## Root Cause
+
+WordPress is dynamically driven by database queries executed during runtime. When plugins and themes neglect object caching, make synchronous external network calls on frontend requests, or execute unindexed database queries inside iterative loops, database I/O saturates and the PHP execution thread stalls waiting for query results.
+
+## Prevention
+
+- Enforce a limit of `< 100 queries` on all key page templates during theme and plugin development.
+- Always use `update_postmeta_cache()`, `update_object_term_cache()`, and `wp_cache_get()` in custom code.
+- Run Query Monitor regularly on staging environments before deploying new plugins or major updates.
+- Monitor slow queries continuously on the server level using MySQL's `slow_query_log`.
+
+## Related Articles
+
+- [/performance/ttfb](/performance/ttfb)
+- [/performance/object-cache](/performance/object-cache)
+- [/mysql/optimize-tables](/mysql/optimize-tables)
+- [/errors/504-gateway-timeout](/errors/504-gateway-timeout)
+
+## Official References
+
+- [Query Monitor: Official Documentation & Advanced Usage](https://querymonitor.com/docs/)
+- [WordPress Developer: Transients API](https://developer.wordpress.org/apis/transients/)
+- [WordPress Developer: Class wpdb and Optimizing Queries](https://developer.wordpress.org/reference/classes/wpdb/)
