@@ -1,0 +1,207 @@
+---
+title: "SSL / TLS Certificate Issues & Renewal Failures"
+description: "Resolving SSL/TLS handshake failures, Let's Encrypt renewal errors, ACME challenge 404s, intermediate certificate chain gaps, and mixed content redirect loops."
+difficulty: Intermediate
+timeToFix: "15–45 min"
+appliesTo: [Hosting, NGINX, Apache, DNS, Security]
+tags: [ssl, tls, letsencrypt, https, hosting]
+severity: High
+updated: 2026-02-15
+featured: true
+---
+
+## Symptoms
+
+- Browsers block access with security warnings: `NET::ERR_CERT_DATE_INVALID` (expired certificate), `SSL_ERROR_BAD_CERT_DOMAIN` (wrong hostname), or `SEC_ERROR_UNKNOWN_ISSUER` (missing intermediate chain).
+- Automated Let's Encrypt / Certbot renewal fails with error: `"Challenge failed for domain example.com (HTTP-01) ... Invalid response from http://example.com/.well-known/acme-challenge/... [404]"` or `[403 Forbidden]`.
+- WordPress Admin is trapped in an infinite redirect loop when HTTPS is enforced (`FORCE_SSL_ADMIN`), or CSS/JS assets fail to load due to mixed content.
+- Third-party APIs (Stripe webhooks, PayPal IPN, cURL calls) fail to connect with: `cURL error 60: SSL certificate problem: unable to get local issuer certificate`.
+- Certbot reports CAA record errors: `DNS problem: query timed out looking up CAA for example.com`.
+
+## Possible Causes
+
+1. **ACME HTTP-01 challenge routing failure**: NGINX or Apache rewrite rules block, redirect, or fail to serve files from the `/.well-known/acme-challenge/` directory during renewal.
+2. **Missing intermediate CA bundle (Broken certificate chain)**: The server configuration references only the leaf `cert.pem` instead of the full chain `fullchain.pem`, causing mobile browsers and cURL to reject the certificate.
+3. **DNS CAA record restriction**: The domain's DNS contains a `CAA` (Certificate Authority Authorization) record that restricts certificates to DigiCert or Sectigo, actively forbidding Let's Encrypt (`letsencrypt.org`).
+4. **Cloudflare / CDN SSL mode mismatch**: Cloudflare SSL mode is set to "Flexible" while WordPress forces HTTPS, triggering an infinite redirect loop, or Cloudflare Universal SSL fails to reissue.
+5. **Multi-domain / SNI misrouting**: Server default virtual host intercepts requests for newly added domains, serving an unrelated certificate.
+6. **Local server clock drift**: The server system clock is skewed by minutes or days, causing active certificates to appear not yet valid or already expired.
+
+## Prerequisites
+
+- Shell access with `sudo` privileges to run `certbot`, `openssl`, and inspect web server configs.
+- Access to domain DNS records (A records, CAA records).
+- Access to NGINX/Apache configuration files (`/etc/nginx/`, `/etc/apache2/`, or cPanel SSL/TLS status).
+- WordPress Administrator access or WP-CLI access to verify `siteurl` and `home` options.
+
+## Investigation
+
+1. **Inspect the live SSL certificate chain using `openssl`**:
+   Verify certificate expiration date, SANs (Subject Alternative Names), and intermediate chain integrity:
+
+```bash
+# Inspect certificate details directly from the public endpoint
+echo | openssl s_client -connect example.com:443 -servername example.com 2>/dev/null | openssl x509 -noout -text | grep -E 'Issuer:|Subject:|Not Before:|Not After:|DNS:'
+```
+
+2. **Test Certbot renewal in dry-run mode**:
+   Reproduce renewal failures without hitting Let's Encrypt rate limits:
+
+```bash
+sudo certbot renew --dry-run
+```
+
+3. **Verify the ACME challenge folder accessibility**:
+   Create a test file in the webroot challenge directory and verify if curl can fetch it over HTTP:
+
+```bash
+# Determine webroot (e.g., /var/www/html or /home/user/public_html)
+mkdir -p /var/www/html/.well-known/acme-challenge/
+echo "acme-test-ok" > /var/www/html/.well-known/acme-challenge/test.txt
+
+# Fetch test file over plain HTTP (no HTTPS, no redirect loop)
+curl -sL http://example.com/.well-known/acme-challenge/test.txt
+```
+
+4. **Query DNS CAA records**:
+   Check if DNS records restrict which authorities can issue certificates:
+
+```bash
+dig +short CAA example.com
+```
+
+5. **Verify system time and NTP sync**:
+
+```bash
+timedatectl
+```
+
+::: investigate
+Investigation mindset: When debugging SSL renewal failures, always test the **HTTP (port 80)** path. Let's Encrypt HTTP-01 challenges begin on port 80. If your `.htaccess` or NGINX config forcefully redirects all HTTP traffic or blocks dot-directories (`.well-known`), the challenge validation will fail with 404 or 403.
+:::
+
+## Diagnosis
+
+| Observed Error / Signature | Failure Mechanism | Root Cause |
+| --- | --- | --- |
+| `NET::ERR_CERT_DATE_INVALID` | Expired Certificate | Cron/Certbot renewal failed or renewal hook failed to reload NGINX |
+| `Invalid response ... [404]` during Certbot renewal | ACME HTTP-01 Validation | `.well-known` path mapped to wrong webroot or blocked by rewrite rules |
+| `cURL error 60: unable to get local issuer certificate` | Broken Chain | Server serves `cert.pem` instead of `fullchain.pem` (missing intermediate CA) |
+| `The authority "letsencrypt.org" is not permitted by CAA` | DNS Policy Block | Domain CAA DNS record forbids Let's Encrypt issuance |
+| Infinite redirect loop on `https://example.com/wp-admin/` | HTTPS Header Stripped | Cloudflare Flexible SSL or reverse proxy not passing `X-Forwarded-Proto` |
+| `SSL_ERROR_BAD_CERT_DOMAIN` | SNI Host Mismatch | Domain missing from certificate Subject Alternative Names (SANs) |
+
+## Resolution
+
+1. **Configure NGINX to cleanly serve the ACME Challenge directory**:
+   Ensure Let's Encrypt can always read challenge files without redirect loops or auth barriers:
+
+```nginx
+# /etc/nginx/sites-available/example.com
+server {
+    listen 80;
+    listen [::]:80;
+    server_name example.com www.example.com;
+
+    # Dedicated ACME challenge rule - DO NOT REDIRECT
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/html;
+        default_type "text/plain";
+        allow all;
+    }
+
+    # Redirect all other HTTP traffic to HTTPS
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+```
+
+Validate and reload:
+```bash
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+2. **Fix Broken Certificate Chains (Serve Fullchain)**:
+   Ensure your web server configuration references the bundled chain:
+
+```nginx
+# In NGINX:
+ssl_certificate /etc/letsencrypt/live/example.com/fullchain.pem; # Contains leaf + intermediate
+ssl_certificate_key /etc/letsencrypt/live/example.com/privkey.pem;
+```
+
+```apache
+# In Apache 2.4.8+:
+SSLCertificateFile /etc/letsencrypt/live/example.com/fullchain.pem
+SSLCertificateKeyFile /etc/letsencrypt/live/example.com/privkey.pem
+```
+
+3. **Re-issue Certificate with Certbot using the Webroot plugin**:
+
+```bash
+sudo certbot certonly --webroot -w /var/www/html -d example.com -d www.example.com --deploy-hook "systemctl reload nginx"
+```
+
+4. **Correct Cloudflare SSL Redirect Loops (Flexible → Full Strict)**:
+   - In Cloudflare Dashboard → **SSL/TLS**:
+     Change encryption mode from **Flexible** to **Full (strict)**.
+   - In `wp-config.php`, ensure WordPress recognizes reverse proxy SSL termination:
+
+```php
+// Add to wp-config.php before the stop editing line
+if ( isset( $_SERVER['HTTP_X_FORWARDED_PROTO'] ) && 'https' === $_SERVER['HTTP_X_FORWARDED_PROTO'] ) {
+    $_SERVER['HTTPS'] = 'on';
+}
+```
+
+5. **Authorize Let's Encrypt in DNS CAA Records**:
+   If CAA records exist, add Let's Encrypt to your DNS zone:
+   ```dns
+   example.com. IN CAA 0 issue "letsencrypt.org"
+   example.com. IN CAA 0 issuewild "letsencrypt.org"
+   ```
+
+6. **Automate Certificate Renewal via Systemd Timer / Cron**:
+   Verify the automated renewal timer is active:
+
+```bash
+sudo systemctl status certbot.timer
+```
+
+## Verification
+
+- Test the public SSL configuration with `curl`:
+  ```bash
+  curl -sIv https://example.com/ 2>&1 | grep -E 'SSL certificate verify ok|expire date|subject:'
+  ```
+- Run SSL Labs test or Qualys SSL checker: Verify an **A or A+ rating** with zero chain issues.
+- Confirm Certbot dry-run completes cleanly:
+  ```bash
+  sudo certbot renew --dry-run
+  ```
+- Verify WordPress admin loads over HTTPS without mixed content warnings in browser console.
+
+## Root Cause
+
+TLS trust relies on a continuous cryptographic chain of trust: Leaf Certificate → Intermediate CA Certificate → Trusted Root CA. When intermediate certificates are omitted from web server responses, older devices and CLI tools fail validation. Additionally, automated renewal mechanisms (ACME HTTP-01) rely on standard HTTP access to challenge tokens; any aggressive rewrite, proxy redirection, or firewall block on port 80 causes renewals to fail silently until the certificate expires.
+
+## Prevention
+
+- Always configure web servers with `fullchain.pem` rather than individual `cert.pem` files.
+- Include a `--deploy-hook "systemctl reload nginx"` in Certbot commands to ensure renewed certs are loaded into memory automatically.
+- Set up monitoring alerts for SSL expiration (alert at 14 days and 7 days prior to expiry).
+- Never use Cloudflare "Flexible" SSL on production WordPress sites—always maintain end-to-end encryption with "Full (Strict)".
+
+## Related Articles
+
+- [/errors/ssl-handshake-failed](/errors/ssl-handshake-failed)
+- [/errors/err-too-many-redirects](/errors/err-too-many-redirects)
+- [/errors/mixed-content](/errors/mixed-content)
+- [/hosting/dns-not-propagating](/hosting/dns-not-propagating)
+
+## Official References
+
+- [Let's Encrypt: Technical Overview of ACME Challenges](https://letsencrypt.org/docs/challenge-types/)
+- [Certbot: Official Documentation and User Guide](https://eff-certbot.readthedocs.io/en/stable/)
+- [Mozilla SSL Configuration Generator](https://ssl-config.mozilla.org/)
